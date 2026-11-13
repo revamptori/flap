@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flap"
+version = "1.0.0"
+description = "A blazing fast Python web framework - Rust core with simple Flask-like syntax, 5x faster than Flask"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "flap contributors", email = "toriiilovesjas@gmail.com" }]
+keywords = ["web", "framework", "flask", "fast", "rust", "async", "http"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Flask",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Internet :: WWW/HTTP :: WSGI",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "httptools>=0.5.0",
+]
+optional-dependencies = { fast = ["uvloop>=0.18.0", "orjson>=3.8.0"], dev = ["flask>=2.0", "pytest", "httpx", "requests"] }
+
+[project.urls]
+Homepage = "https://github.com/revamptori/flap"
+Repository = "https://github.com/revamptori/flap"
+Issues = "https://github.com/revamptori/flap/issues"
+Documentation = "https://github.com/revamptori/flap/blob/main/docs/DOCUMENTATION.md"
+
+[tool.setuptools.packages.find]
+include = ["flap*"]
+
+[tool.setuptools.package-data]
+flap = ["py.typed"]
+
+[project.scripts]
+flap = "flap.cli:main"
+
+# Rust extension config (optional, via maturin when Rust toolchain available)
+# When you have Rust installed, build with: pip install maturin && maturin develop --release
+# Otherwise the pure-Python fallback (httptools+uvloop) is used automatically.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

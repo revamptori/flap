@@ -1,0 +1,44 @@
+[package]
+name = "flap"
+version = "1.0.0"
+edition = "2021"
+description = "A blazing fast Python web framework - Rust core (hyper + axum + tokio) with PyO3 bindings"
+license = "MIT"
+authors = ["flap contributors"]
+keywords = ["web", "framework", "http", "flask", "fast"]
+repository = "https://github.com/revamptori/flap"
+readme = "README.md"
+
+[lib]
+name = "flap"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "generate-import-lib"] }
+tokio = { version = "1.35", features = ["full"] }
+hyper = { version = "1.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+axum = { version = "0.7", features = ["macros", "json"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.5"
+http-body-util = "0.1"
+hyper-tungstenite = { version = "0.13", optional = true }
+
+# For performance: smallvec, ahash
+smallvec = "1.11"
+ahash = "0.8"
+
+[features]
+default = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0

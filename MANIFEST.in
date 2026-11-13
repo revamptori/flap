@@ -1,0 +1,2 @@
+include README.md LICENSE docs/*.md examples/*.py src/*.rs Cargo.toml
+recursive-include flap *.py
