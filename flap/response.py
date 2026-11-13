@@ -36,6 +36,9 @@ _STATUS_TEXT = {
 def _status_text(code: int) -> bytes:
     return _STATUS_TEXT.get(code, b"OK")
 
+# Precompute status lines for hot path (avoid per-request str(status).encode())
+_STATUS_LINES = {code: b"HTTP/1.1 " + str(code).encode() + b" " + text + b"\r\n" for code, text in _STATUS_TEXT.items()}
+
 class Response:
     """
     Outgoing HTTP response.
@@ -79,13 +82,37 @@ def redirect(url: str, status: int = 302) -> Response:
 def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optional[str]]:
     """
     Convert handler return value into canonical tuple (status, headers, body_bytes, content_type)
+    Optimized: fast-path for common str/bytes/dict without tuple check.
     """
+    # Fast path: most handlers return str/dict/bytes directly (no tuple)
+    # Check Response first (rare)
+    if isinstance(result, Response):
+        inner_status, inner_headers, inner_body, inner_ct = normalize_response(result.body)
+        status = result.status if result.status else inner_status
+        merged = dict(inner_headers)
+        merged.update(result.headers)
+        ct = result.content_type or inner_ct
+        return status, merged, inner_body, ct
+
+    if isinstance(result, str):
+        # Fastest path: string -> encode
+        return 200, {}, result.encode("utf-8"), "text/plain; charset=utf-8"
+    if isinstance(result, bytes):
+        return 200, {}, result, None
+    if isinstance(result, (dict, list)):
+        if _HAS_ORJSON:
+            return 200, {}, _orjson.dumps(result), "application/json"
+        else:
+            return 200, {}, json.dumps(result, separators=(",", ":")).encode("utf-8"), "application/json"
+    if result is None:
+        return 200, {}, b"", "text/plain; charset=utf-8"
+
+    # Tuple unpack for (body, status) or (body, status, headers)
     status = 200
     headers: Dict[str, str] = {}
     body = result
     content_type: Optional[str] = None
 
-    # unpack tuple returns
     if isinstance(result, tuple):
         if len(result) == 2:
             body, status = result
@@ -95,42 +122,32 @@ def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optiona
             raise ValueError("Invalid response tuple: expected (body, status) or (body, status, headers)")
         if headers is None:
             headers = {}
+        # Recurse for body inside tuple (but avoid double recursion for Response)
+        if isinstance(body, Response):
+            inner_status, inner_headers, inner_body, inner_ct = normalize_response(body.body)
+            status = body.status if body.status else inner_status
+            merged = dict(inner_headers)
+            merged.update(body.headers)
+            ct = body.content_type or inner_ct
+            # Merge tuple headers override as well
+            merged.update(headers)
+            return status, merged, inner_body, ct
+        if isinstance(body, str):
+            return status, headers, body.encode("utf-8"), "text/plain; charset=utf-8"
+        if isinstance(body, bytes):
+            return status, headers, body, None
+        if isinstance(body, (dict, list)):
+            if _HAS_ORJSON:
+                return status, headers, _orjson.dumps(body), "application/json"
+            else:
+                return status, headers, json.dumps(body, separators=(",", ":")).encode("utf-8"), "application/json"
+        if body is None:
+            return status, headers, b"", "text/plain; charset=utf-8"
+        # fallback stringify
+        return status, headers, str(body).encode("utf-8"), "text/plain; charset=utf-8"
 
-    if isinstance(body, Response):
-        # recursive normalization but respect its status/headers/content_type
-        inner_status, inner_headers, inner_body, inner_ct = normalize_response(body.body)
-        # Merge: Response's status/headers override inner
-        status = body.status if body.status else inner_status
-        # merge headers
-        merged = dict(inner_headers)
-        merged.update(body.headers)
-        # if Response had explicit content_type
-        ct = body.content_type or inner_ct
-        return status, merged, inner_body, ct
-
-    # Now body is primitive
-    if body is None:
-        body_bytes = b""
-        content_type = content_type or "text/plain; charset=utf-8"
-    elif isinstance(body, bytes):
-        body_bytes = body
-        # don't set content_type here, let caller decide or default octet-stream later
-        content_type = None
-    elif isinstance(body, str):
-        body_bytes = body.encode("utf-8")
-        content_type = "text/plain; charset=utf-8"
-    elif isinstance(body, (dict, list)):
-        if _HAS_ORJSON:
-            body_bytes = _orjson.dumps(body)
-        else:
-            body_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        content_type = "application/json"
-    else:
-        # fallback: stringify
-        body_bytes = str(body).encode("utf-8")
-        content_type = "text/plain; charset=utf-8"
-
-    return status, headers, body_bytes, content_type
+    # Fallback stringify for int etc.
+    return 200, {}, str(result).encode("utf-8"), "text/plain; charset=utf-8"
 
 
 def build_http_response(
@@ -145,16 +162,19 @@ def build_http_response(
     Build raw HTTP/1.1 response bytes. Highly optimized: uses precomputed status texts,
     minimal allocations, and avoids per-request formatting overhead where possible.
     """
-    reason = _status_text(status)
-    # Start line
-    # Using byte concatenation is faster than join for small responses? Use join for readability.
-    # We'll build header block as list of bytes and join with b"\r\n"
-    buf = bytearray()
-    buf.extend(b"HTTP/1.1 ")
-    buf.extend(str(status).encode())
-    buf.extend(b" ")
-    buf.extend(reason)
-    buf.extend(b"\r\n")
+    # Use precomputed status line if available (fast path)
+    status_line = _STATUS_LINES.get(status)
+    buf = bytearray(512)  # pre-allocate 512 bytes (typical header size)
+    buf.clear()
+    if status_line is not None:
+        buf.extend(status_line)
+    else:
+        reason = _status_text(status)
+        buf.extend(b"HTTP/1.1 ")
+        buf.extend(str(status).encode())
+        buf.extend(b" ")
+        buf.extend(reason)
+        buf.extend(b"\r\n")
 
     # Content-Type handling
     has_ct = False

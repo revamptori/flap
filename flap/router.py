@@ -1,4 +1,5 @@
 import re
+import functools
 from typing import Callable, Dict, List, Tuple, Optional, Pattern, Any
 
 # Pattern for Flask-style path parameters: <name> , <int:name> , <path:name> , <str:name>
@@ -42,11 +43,21 @@ def compile_path(path: str) -> Tuple[Pattern, List[str], Dict[str, str]]:
 
 
 class Route:
+    __slots__ = ("path", "methods", "handler", "cache", "is_dynamic", "regex", "param_names", "param_types", "_prebuilt", "needs_request")
     def __init__(self, path: str, methods: List[str], handler: Callable, cache: bool = False):
         self.path = path
         self.methods = set(m.upper() for m in methods)
         self.handler = handler
         self.cache = cache
+        self._prebuilt = None
+        # Inspect handler signature to see if it needs Request (fast-path: no Request alloc if handler has 0 args)
+        try:
+            import inspect
+            sig = inspect.signature(handler)
+            # handler(req, ...) -> first param is req; if no params, we can skip Request creation for cached static
+            self.needs_request = len(sig.parameters) > 0
+        except Exception:
+            self.needs_request = True
         # detect if dynamic or static
         self.is_dynamic = "<" in path
         if self.is_dynamic:
@@ -103,22 +114,30 @@ class Router:
                 if key in self.static_routes:
                     raise ValueError(f"Duplicate route for {method} {route.path}")
                 self.static_routes[key] = route
+        # Invalidate lru cache when new route added
+        try:
+            self.match.cache_clear()
+            self.match_with_route.cache_clear()
+        except AttributeError:
+            pass
 
+    @functools.lru_cache(maxsize=2048)
     def match(self, method: str, path: str) -> Tuple[Optional[Callable], Optional[Dict[str, Any]]]:
         # Fast path: static
         key = (method, path)
         route = self.static_routes.get(key)
         if route is not None:
             return route.handler, {}
-        # Dynamic fallback
+        # Dynamic fallback - cached via lru_cache for repeated paths like /hello/world
         for route in self.dynamic_routes:
             params = route.matches(method, path)
             if params is not None:
                 return route.handler, params
         return None, None
 
+    @functools.lru_cache(maxsize=2048)
     def match_with_route(self, method: str, path: str) -> Tuple[Optional[Callable], Optional[Dict[str, Any]], Optional["Route"]]:
-        """Return handler, params, and Route (for cache inspection)"""
+        """Return handler, params, and Route (for cache inspection) - cached"""
         key = (method, path)
         route = self.static_routes.get(key)
         if route is not None:

@@ -1,6 +1,8 @@
 """Flask baseline app for benchmarking - simple routes mirroring flap examples"""
 from flask import Flask, request, jsonify
 
+ITEMS_3K = list(range(3000))
+
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
@@ -27,7 +29,7 @@ def search():
 @app.route("/json", methods=["GET"])
 def json_route():
     # Large JSON to demonstrate orjson vs stdlib json speedup (5x)
-    return jsonify({"message": "hello", "items": list(range(3000)), "nested": {"a": "b", "count": 3000}})
+    return jsonify({"message": "hello", "items": ITEMS_3K, "nested": {"a": "b", "count": 3000}})
 
 # Add many dummy routes to demonstrate O(N) vs O(1) routing - flap shines here
 # With 500 routes, Flask scans all rules sequentially while flap uses hash map
