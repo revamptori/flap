@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.10)
+project(flap_drogon_bench)
+set(CMAKE_CXX_STANDARD 17)
+find_package(Drogon REQUIRED)
+add_executable(drogon_app main.cc)
+target_link_libraries(drogon_app Drogon::Drogon)

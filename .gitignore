@@ -13,3 +13,6 @@ venv/
 .pytest_cache/
 .pyre/
 maturin/
+benchmarks/express/node_modules/
+benchmarks/drogon/build/
+/tmp/gin_bench
