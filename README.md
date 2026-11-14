@@ -66,25 +66,29 @@ Then open `http://localhost:8000`. That's it.
 
 ## Installation
 
-### Default (Rust engine, fastest)
-Requires Rust ≥1.75 and `maturin` for release build:
+**No compilation needed for either engine — wheels include Rust:**
+
 ```bash
-pip install maturin
+pip install flap   # gets Rust wheel if available for your platform/Python, else pure-Python fallback (both ~5× Flask)
+uv add flap        # same, via uv
+```
+
+`wheels.yml` builds `cp38-cp313` for Linux/macOS/Windows (`maturin build --release --strip`) and publishes to PyPI on tag. `setuptools-rust` is `optional=true`, so sdist `pip install flap` never requires `cargo`.
+
+### From source (optional, for contributors)
+
+```bash
 git clone https://github.com/revamptori/flap
 cd flap
-maturin develop --release  # enables LTO, opt-level 3
+pip install maturin && maturin develop --release  # local Rust build, enables LTO, opt-level 3
 python -c "import flap; print(flap._RUST_AVAILABLE)"  # True
 ```
-The same Python API is used; `app.run()` defaults to Rust and prints `Rust engine: tokio+hyper+axum`.
 
-### Python fallback (no Rust needed — still faster than Flask)
+The same Python API is used; `app.run()` defaults to Rust and prints `Rust engine: tokio+hyper+axum`. Force fallback:
+
 ```bash
-pip install flap
-# Optional speed boost for Python fallback:
-pip install flap[fast]   # adds uvloop + orjson
-
-# Force fallback even if Rust is installed:
 FLAP_ENGINE=python python app.py
+pip install flap[fast]  # uvloop+orjson +15% for Python fallback
 ```
 
 ### Verify engine

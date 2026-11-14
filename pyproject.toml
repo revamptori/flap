@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=61", "wheel", "setuptools-rust>=1.9"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,6 +21,8 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Topic :: Internet :: WWW/HTTP :: WSGI",
@@ -46,9 +48,14 @@ flap = ["py.typed"]
 [project.scripts]
 flap = "flap.cli:main"
 
-# Rust extension config (optional, via maturin when Rust toolchain available)
-# When you have Rust installed, build with: pip install maturin && maturin develop --release
-# Otherwise the pure-Python fallback (httptools+uvloop) is used automatically.
+# Rust extension (optional) — pip install flap works without Rust toolchain
+# If Rust is present, pip will compile it; if not, pure-Python fallback is used.
+# Prebuilt wheels (maturin) on PyPI include Rust so most users get Rust without compiling.
+[[tool.setuptools-rust.ext-modules]]
+target = "flap._flap"
+path = "Cargo.toml"
+binding = "PyO3"
+optional = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
