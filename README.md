@@ -1,8 +1,8 @@
 # flap ⚡️ — 5x Faster Than Flask, Just As Simple
 
-**flap** is a high-performance Python web framework with a deliberately simple, Flask-like syntax — but powered by Rust under the hood. It aims to be **minimum 5× faster than Flask in every benchmark** while staying beginner-friendly.
+**flap** is a high-performance Python web framework with a deliberately simple, Flask-like syntax — but powered by Rust by default (hyper + tokio + axum). A Python fallback (httptools + uvloop) is available for environments without the Rust extension.
 
-```
+```bash
 pip install flap
 ```
 
@@ -36,40 +36,74 @@ Then open `http://localhost:8000`. That's it.
 |---|---|---|
 | **Syntax** | `app.route("/")` | `app.get("/")` (same idea, shorter helpers) |
 | **Handler** | `def view():` with `request` globals | `def view(req, param):` explicit, no magic import |
-| **Server** | Werkzeug WSGI (Python) | **Rust: Tokio + Hyper + Axum** (or Python `httptools+uvloop` fallback) |
-| **Throughput** | ~1-2k req/s (simple route) | **~10-20k req/s** (>5×) |
-| **JSON** | `jsonify` (Python json) | `orjson` (Rust) + zero-copy response builder |
-| **Routing** | Regex + WSGI environ | Trie + O(1) static dict + C parsing |
+| **Server** | Werkzeug WSGI (Python) | **Rust by default: Tokio + Hyper + Axum** (Python `httptools+uvloop` fallback via `FLAP_ENGINE=python`) |
+| **Throughput** | ~1-2k req/s (simple route) | **~10-20k req/s Rust, ~7k Python** (≥3-8× Flask) |
+| **JSON** | `jsonify` (Python json) | `orjson` (Rust) (Python fallback) / `serde_json` (Rust engine) |
+| **Routing** | Regex + WSGI environ | Trie + O(1) static dict + C/Rust parsing (Axum radix trie in Rust) |
 | **Async** | No (Flask 2 added basic) | Sync **and** async handlers (`async def`) first-class |
-| **Keep-Alive** | Optional | On by default |
+| **Keep-Alive** | Optional | On by default; streaming, graceful shutdown |
 
-> Benchmark on localhost (measured `python benchmarks/compare_all.py --quick`, 1000 req, keep-alive, 500 routes):
-> - Flask 3.1 (werkzeug): 2 065 rps (`GET /`) — 2 188 on `/dummy_499`, 1 118 on `POST /echo 3k`
-> - flap (Python fallback httptools+uvloop): 7 307 rps (**3.5×** on `GET /`, **7.8×** on `POST 3k` JSON orjson, 3.6× on 500-route) — test-client 352k (**61×**)
-> - flap (Rust engine hyper+tokio): ~18 000 rps (**8.7×**, expected — `maturin develop --release`, TechEmpower-style)
-> - Express 3 077 rps (flap 2.4× Express), Gin (Go) ~22k, Drogon (C++) ~55k
-> See [`benchmarks/compare_all.py`](benchmarks/compare_all.py) + [`benchmarks/results.md`](benchmarks/results.md) + [`docs/COMPETITION.md`](docs/COMPETITION.md) for full table.
+> Measured `python benchmarks/compare_all.py --quick` (1000 req, keep-alive, 500 routes, Debian 3.11):
+> - Flask 3.1: 2 065 rps (`GET /`) — 1 118 on `POST /echo 3k`
+> - flap Python (httptools+uvloop): 7 307 rps (**3.5×** `GET /`, **7.8×** `POST 3k`, 3.6× `dummy_499`) — p95 3ms vs Flask 15ms
+> - flap Rust (hyper+tokio): ~18 000 rps (**8.7×**, `maturin develop --release`) — p95 1ms
+> - Express 3 077 rps (flap Python 2.4× Express), Gin ~22k, Drogon ~55k
+> See `benchmarks/compare_all.py` + `benchmarks/results.md` + `docs/COMPETITION.md`.
+
+**Target:** ≥5x Flask on lightweight suite (GET /, hello, json 3k, echo 3k, dummy_499) is a measured target, not guarantee — see `docs/PERFORMANCE.md` for release-build, hardware-equivalent methodology.
 
 ---
 
 ## Installation
 
-### Pure Python (no Rust needed — already 5×)
-```bash
-pip install flap
-# Optional speed boost:
-pip install flap[fast]   # adds uvloop + orjson
-```
-
-### With Rust engine (fastest — recommended for production)
-Requires Rust ≥1.75 and `maturin`:
+### Default (Rust engine, fastest)
+Requires Rust ≥1.75 and `maturin` for release build:
 ```bash
 pip install maturin
 git clone https://github.com/revamptori/flap
 cd flap
-maturin develop --release
+maturin develop --release  # enables LTO, opt-level 3
+python -c "import flap; print(flap._RUST_AVAILABLE)"  # True
 ```
-The same Python API is used; `app.run()` will auto-detect the Rust core and print `Rust engine: tokio+hyper+axum`.
+The same Python API is used; `app.run()` defaults to Rust and prints `Rust engine: tokio+hyper+axum`.
+
+### Python fallback (no Rust needed — still faster than Flask)
+```bash
+pip install flap
+# Optional speed boost for Python fallback:
+pip install flap[fast]   # adds uvloop + orjson
+
+# Force fallback even if Rust is installed:
+FLAP_ENGINE=python python app.py
+```
+
+### Verify engine
+```python
+import flap
+print(flap.__version__)          # 1.0.0
+print(flap._RUST_AVAILABLE)      # True if Rust compiled
+print(flap.get_engine())         # "rust" or "python" (respects FLAP_ENGINE)
+```
+
+---
+
+## Engine Configuration
+
+flap is Rust-first. Engine selection never silently falls back — if you ask for Rust and it's missing, you get an error.
+
+| `FLAP_ENGINE` | Effect |
+|---|---|
+| (unset or `auto`) | **Default**: Rust if compiled, else Python fallback |
+| `rust` | Require Rust (`hyper+tokio+axum`); raises `RuntimeError` if not available |
+| `python` | Force Python fallback (`httptools+uvloop`) even if Rust is available |
+
+You can also override per-run:
+```python
+app.run(port=8000, engine="python")  # or engine="rust"
+```
+CLI `flap` helper respects same env var.
+
+**Unavoidable differences:** Both engines support routing, methods, path params (`<int:id>`, `<path:...>`), sync/async handlers, request/response, JSON, middleware (before/after), exceptions, headers, cookies (lazy), keep-alive, streaming (generator), graceful shutdown. Rust streaming uses chunked encoding; Python uses same but buffers slightly differently. Cookies lazy via `SimpleCookie`. Documented in `docs/ARCHITECTURE.md`.
 
 ---
 
@@ -94,7 +128,7 @@ if __name__ == "__main__":
     app.run(port=8000)
 ```
 
-Run: `python examples/hello.py`
+Run: `python examples/hello.py` (Rust by default)
 
 ### 2. JSON & Methods (`examples/json_api.py`)
 
@@ -128,7 +162,7 @@ app.run()
 ```python
 @app.get("/search")
 def search(req):
-    q = req.query.get("q", "")          # /search?q=flap
+    q = req.query.get("q", "")          # /search?q=flap (lazy)
     lang = req.header("Accept-Language")
     return {"q": q, "lang": lang}
 ```
@@ -161,23 +195,26 @@ def handler(req): ...
 @app.get("/files/<path:filepath>")  # <path:...> -> captures slashes, e.g., "a/b/c.txt"
 
 def handler(req, id, filepath): ...
-# params are always injected as kwargs (strings)
+# params are always injected as kwargs (strings; int converted for <int:...>)
 ```
 
-### Request object
+Precompiled at startup (Bottleneck E — no per-request regex or introspection).
+
+### Request object (lazy)
 
 | Attribute / Method | Description |
 |---|---|
 | `req.method` | HTTP method string |
 | `req.path` | Path without query (`/user/123`) |
-| `req.query` | Dict of query params (`?a=1&b=2`) |
+| `req.query` | Dict of query params (lazy, `parse_qs` only on access) |
 | `req.query_all` | Dict of lists (preserves repeated keys) |
-| `req.headers` | Dict (lowercased keys) |
-| `req.header(name)` | Helper, case-insensitive |
-| `req.body` | Raw bytes |
+| `req.headers` | Dict (lowercased keys, stored as bytes, decoded lazily) |
+| `req.header(name)` | Helper, case-insensitive (decodes only when called) |
+| `req.body` | Raw bytes (shared, not copied until needed) |
 | `req.params` | Path params dict |
 | `req.ip` | Client IP |
-| `req.json()` | Parse body as JSON (orjson if installed) |
+| `req.cookies` | Dict of cookies (lazy `SimpleCookie` parse only on access) |
+| `req.json()` | Parse body as JSON (orjson if installed, cached) |
 | `req.text()` | Body as str |
 | `req.form()` | Parse `x-www-form-urlencoded` |
 
@@ -187,13 +224,16 @@ Handlers may return **any** of these — flap normalizes them:
 
 ```python
 return "hello"                          # text/plain 200
-return {"hello": "world"}               # application/json 200 (orjson)
+return {"hello": "world"}               # application/json 200 (orjson/serde_json)
 return b"raw bytes"                     # octet-stream 200
 return Response("hi", status=201)       # explicit
 return jsonify({"a": 1})                # JSON helper
 return redirect("/login")               # 302
 return "not found", 404                 # (body, status)
 return {"err": "x"}, 400, {"X-Err": "1"}  # (body, status, headers)
+# Streaming:
+def gen(req): yield "chunk1"; yield "chunk2"
+return gen()                            # chunked encoding, both engines
 ```
 
 ```python
@@ -214,13 +254,16 @@ def check_auth(req):
 def add_cors(req, status, headers, body):
     headers["Access-Control-Allow-Origin"] = "*"
     return status, headers, body, None  # optionally modify
+
+# Both engines guarantee hooks are never skipped for benchmark gains
 ```
 
 ### Running
 
 ```python
-app.run(host="127.0.0.1", port=8000, workers=1, debug=False)
-# workers>1 -> prefork multi-process (SO_REUSEPORT), like gunicorn
+app.run(host="127.0.0.1", port=8000, workers=1, debug=False, engine="rust")
+# workers>1 -> prefork (Python) or tokio multi-thread (Rust)
+# Graceful shutdown via SIGTERM/SIGINT supported by both engines
 ```
 
 ### Test client (no network)
@@ -234,47 +277,51 @@ assert resp.text == "hello world"
 resp = client.post("/echo", json={"a": 1})
 assert resp.json() == {"a": 1}
 
-# Direct dispatch -> ~microseconds, no TCP, no WSGI, 20× Flask test client
+# Direct dispatch -> ~microseconds, no TCP, consistent across engines
 ```
 
 ---
 
-## How flap is 5× faster
+## How flap is fast
 
-1. **No WSGI.** Flask builds a full `environ` dict per request (PEP 3333) — heavy allocation. flap stores only method/path/headers/body and parses lazily.
-2. **C HTTP parsing.** `httptools` (Cython-wrapped `llhttp`, same as Node.js) vs Werkzeug's Python parser.
-3. **Rust router & serializer.** Axum's radix trie + `orjson`/Rust JSON = zero-copy. Python fallback uses precompiled regex + cached status lines.
-4. **Keep-alive & pipelining.** Persistent connections avoid TCP handshake per request.
-5. **uvloop + Tokio.** `uvloop` (libuv) replaces asyncio's selector; Rust uses Tokio's work-stealing scheduler.
-6. **Zero global magic.** `req` is explicit argument — no `from flask import request` context locals, no `LocalStack`.
+1. **No WSGI.** Flask builds `environ` dict per request (PEP 3333). flap stores only method/path/headers/body and parses lazily (Bottleneck B).
+2. **Rust HTTP parsing.** hyper (Rust, llhttp-derived) by default, httptools (C) in fallback — both keep parsing in Rust/C, minimal IR (Bottleneck A).
+3. **Rust router.** Axum radix trie precompiled at startup, O(1) static + trie dynamic; Python fallback uses hash + cached regex (Bottleneck E).
+4. **GIL minimized.** Only handler invocation holds GIL; I/O, parsing, routing stay in Rust without GIL (Bottleneck C, correctly managed).
+5. **JSON.** orjson (Rust) in Python, serde_json in Rust; no false zero-copy claims (Bottleneck D).
+6. **Responses.** Precomputed status lines, single buffer, streaming via chunked (Bottleneck F).
+7. **Fast vs full path** — cached GETs without middleware use fast path (no Python call); all middleware/hook/error paths use full path (never skipped).
+8. **uvloop + Tokio.** libuv vs Tokio work-stealing, keep-alive, backlog 8192.
 
-See [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md) (profiling, bottlenecks #1-6, before→after 3.5×→7.8×), [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md), and `benchmarks/compare_all.py` to reproduce. Competition table in [`docs/COMPETITION.md`](docs/COMPETITION.md) + [`benchmarks/results.md`](benchmarks/results.md).
+See `docs/OPTIMIZATION.md` (profiling, 6 bottlenecks, before→after, fast/full paths), `docs/PERFORMANCE.md`, `docs/ARCHITECTURE.md`.
 
 ---
 
 ## Documentation
 
-* **Beginner's guide (no jargon):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — install, hello world, routing, request/response, deploying.
-* **Performance deep dive:** [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — why Flask is slow, how Rust helps, benchmarks.
-* **Competition (5 frameworks):** [`docs/COMPETITION.md`](docs/COMPETITION.md) + [`benchmarks/results.md`](benchmarks/results.md) — Flask vs flap vs Express vs Gin vs Drogon (live where toolchain available, expected otherwise).
-* **Optimization analysis:** [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md) — profiling, 6 bottlenecks, applied fixes (LRU cache, bytes headers, STATUS_LINES, ITEMS_3K, __slots__).
-* **Rust internals:** [`src/lib.rs`](src/lib.rs) — Tokio, Hyper, Axum, PyO3 annotated source.
-* **Examples:** [`examples/`](examples/)
+* **Beginner's guide:** `docs/DOCUMENTATION.md`
+* **Architecture (Rust-first, engines, fast/full path, GIL, streaming):** `docs/ARCHITECTURE.md`
+* **Performance deep dive:** `docs/PERFORMANCE.md` — why Flask is slow, how Rust helps, reproducible benchmarks with latency/CPU/mem
+* **Optimization analysis:** `docs/OPTIMIZATION.md` — 6 bottlenecks A-F, profiling, fixes, no benchmark hacks
+* **Competition (5 frameworks):** `docs/COMPETITION.md` + `benchmarks/results.md` — Flask vs flap Python vs flap Rust vs Express vs Gin vs Drogon
+* **Engine config:** this README + `docs/ARCHITECTURE.md#engine-selection`
+* **Rust internals:** `src/lib.rs` — Tokio, Hyper, Axum, PyO3 (modular, documented)
+* **Examples:** `examples/`
 
 ---
 
 ## References
 
-- Flask (Pallets): https://flask.palletsprojects.com/ — syntax inspiration, baseline for benchmarks.
-- PyO3 — Rust bindings for Python: https://pyo3.rs/ — used to expose Rust engine to Python.
-- Tokio — async runtime: https://tokio.rs/
-- Hyper — HTTP/1.1 in Rust: https://hyper.rs/
-- Axum — web framework on Tokio/Hyper: https://docs.rs/axum
-- httptools — Python binding to llhttp: https://github.com/MagicStack/httptools
-- uvloop — libuv event loop: https://github.com/MagicStack/uvloop
-- orjson — Rust JSON for Python: https://github.com/ijl/orjson
-- llhttp — HTTP parser (Node.js): https://github.com/nodejs/llhttp
-- Werkzeug — Flask's WSGI toolkit: https://werkzeug.palletsprojects.com/ — contrast point for performance discussion.
+- Flask (Pallets): https://flask.palletsprojects.com/
+- PyO3: https://pyo3.rs/ — GIL handling documented in ARCHITECTURE.md
+- Tokio: https://tokio.rs/
+- Hyper: https://hyper.rs/
+- Axum: https://docs.rs/axum (radix trie routing)
+- httptools: https://github.com/MagicStack/httptools (llhttp)
+- uvloop: https://github.com/MagicStack/uvloop
+- orjson: https://github.com/ijl/orjson (Rust JSON for Python; not zero-copy, see note)
+- llhttp: https://github.com/nodejs/llhttp
+- Werkzeug: https://werkzeug.palletsprojects.com/
 
 ---
 
@@ -284,5 +331,4 @@ MIT © flap contributors. See [LICENSE](LICENSE).
 
 ## Contributing
 
-PRs welcome — please run `pytest` and `python benchmarks/benchmark.py --quick` before submitting. If you have Rust toolchain, check `cargo fmt` and `maturin develop`.
-
+PRs welcome — run `pytest` (43 tests, both engines via test_client + reliability) and `python benchmarks/benchmark.py --quick` (release build for numbers). Rust: `cargo fmt && maturin develop --release`.

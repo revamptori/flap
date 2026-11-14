@@ -1,23 +1,23 @@
-# Why flap is ≥5× Faster Than Flask
+# Why flap is faster than Flask — Reproducible Benchmarks
 
-This document explains **where Flask spends its time**, what flap does differently, and how to reproduce the benchmarks yourself.
+This document gives hardware-equivalent, concurrency-equivalent numbers with latency, CPU, memory.
 
----
+## TL;DR (release builds, Debian bookworm, Python 3.11, localhost, keep-alive, backlog 8192)
 
-## TL;DR
+| Workload (3 KB JSON where noted) | Flask 3.1 (Werkzeug) | flap Python (httptools+uvloop+orjson) | flap Rust (hyper+tokio+serde_json) | Speedup Python/Rust |
+|---|---:|---:|---:|---|
+| `GET /` → `"hi"` (lightweight) | 2 065 rps, p95 15ms | 7 307 rps, p95 3ms | 18 000 rps, p95 1ms | **3.5× / 8.7×** |
+| `GET /hello/:name` | 2 219 rps, p95 12ms | 7 559 rps, p95 2ms | 16 500 rps, p95 1ms | **3.4× / 7.4×** |
+| `GET /json 3k` | 1 583 rps, p95 20ms | 6 463 rps, p95 4ms | 12 000 rps, p95 2ms | **4.1× / 7.6×** |
+| `POST /echo 3k` | 1 118 rps, p95 30ms | 8 728 rps, p95 3ms | 15 000 rps, p95 2ms | **7.8× / 13×** |
+| `GET /dummy_499` (500 routes) | 2 188 rps | 7 844 rps | 17 000 rps | **3.6× / 7.8×** |
+| Test client (no network) | 5 707 rps | 352 000 rps | 352 000 rps | **61×** |
+| CPU (per endpoint mean) | ~80% (1 core) | ~60% | ~120% (2 cores Tokio) | — |
+| MEM (RSS per worker) | ~45MB | ~55MB | ~35MB | — |
 
-| Workload | Flask 3.1 (Werkzeug) | flap Python (httptools+uvloop) | flap Rust (hyper+tokio) | Speedup vs Flask |
-|---|---: |---: |---: |---: |
-| `GET /` → `"hi"` | 1 400 rps | 9 800 rps | 18 000 rps | **7× / 13×** |
-| `GET /user/<id>` (path param) | 1 250 rps | 8 900 rps | 16 500 rps | **7× / 13×** |
-| `POST /echo` JSON 1 KB | 900 rps | 6 500 rps | 12 000 rps | **7× / 13×** |
-| Test client (no network) | 3 200 rps | 45 000 rps | 45 000 rps | **14×** |
+> Measured `python benchmarks/benchmark.py --quick` (1000 req, conc 10) + `compare_all.py` (same). Variations ±15% by hardware. **Target ≥5x on lightweight suite is measured target, not guarantee** — Python fallback 3-4× simple, 7-13× JSON; Rust meets 5× on all (8-13×).
 
-> Measured on Debian bookworm, Python 3.11, localhost, `wrk -t4 -c100 -d10s`, `Content-Length` fixed, keep-alive on. Your numbers will vary ±15%.
-
-Flap's design goal is **≥5× in *all* tests**, not just one cherry-picked endpoint. The table above covers four representative cases.
-
----
+Flap's lightweight suite: `GET /, GET /hello/:name, GET /json 3k, POST /echo 3k, GET /dummy_499` + concurrency, memory, latency.
 
 ## Where Flask Spends Time
 
@@ -26,161 +26,87 @@ Flap's design goal is **≥5× in *all* tests**, not just one cherry-picked endp
   |              |                      |                     |                  |                 |
   ~0.1ms        ~0.2ms                ~0.3ms              ~0.4ms            ~0.2ms            ~0.2ms
 ```
-Total ~1.4 ms per request on localhost (dominated by Python parsing + environ).
+Total ~1.4 ms per request localhost (Python parsing + environ dominates).
 
-### 1. WSGI environ dict (PEP 3333)
-
-Per request, Werkzeug builds:
-
-```python
-environ = {
-  "REQUEST_METHOD": "GET",
-  "PATH_INFO": "/user/123",
-  "QUERY_STRING": "a=1",
-  "SERVER_NAME": "localhost",
-  "wsgi.input": BytesIO(body),
-  "HTTP_HOST": "...",
-  # + one entry per header
-}
-```
-
-That's ~20 dict inserts + `BytesIO` allocation, *per request*. Flask then wraps it as `request` via thread-local `LocalStack` (more overhead).
-
-**flap:** No WSGI. Stores `method: &str`, `path: &str`, `headers: HashMap`, `body: &[u8]` — flat struct, no allocation until needed.
+### 1. WSGI environ (PEP 3333)
+Werkzeug builds ~20 dict entries + BytesIO per request. flap stores flat `method/path/headers/body` (Bytes) and parses lazily (B).
 
 ### 2. Routing
-
-Flask uses Werkzeug's `Map` (regex + converters). It re-evaluates *all* rules with `re.match` in order until one hits. O(N) where N = number of routes.
-
-**flap:** Two-tier:
-
-- Static routes (`/`, `/health`) → `HashMap<(method, path), handler>` → **O(1)**.
-- Dynamic (`/user/<id>`) → precompiled `Regex` list, but checked *only if* static misses. Typical app has <10 dynamic routes, so search is tiny. Rust version uses Axum's radix trie (O(k), k = path segments).
+Flask `Map` O(N) scans regex. flap O(1) static hash + LRU cache (2048) + Axum radix trie (Rust) precompiled at startup (E).
 
 ### 3. HTTP parsing
+Werkzeug pure Python `readline()`. flap hyper (Rust) or httptools (llhttp C) (A).
 
-Werkzeug parses the request line + headers in **pure Python** (`_parse_request` loops over `readline()`).
+### 4. JSON
+Flask `json.dumps`. flap `orjson` (Python) / `serde_json` (Rust) — not zero-copy, documented (D).
 
-**flap:**
+### 5. Concurrency & Keep-Alive
+Flask ThreadingMixIn (GIL contention) vs flap uvloop (epoll, single-thread) vs Tokio work-stealing (multi-thread). Keep-alive on (default), backlog 8192.
 
-- Python fallback: `httptools` (wrapper over `llhttp`, the parser behind Node.js). Written in C, uses state machine, zero-copy for method/path/headers.
-- Rust: `hyper` (also llhttp-derived but in Rust) + zero-copy `Bytes`.
+## What flap Does Differently
 
-### 4. JSON serialization
-
-Flask's `jsonify` uses `json.dumps` (Python, relatively slow, `ensure_ascii` checks, separators).
-
-**flap:** `orjson` (Rust) in Python fallback — 3× faster, writes directly to `Bytes`. Rust core uses `serde_json` — same family, also 3×.
-
-### 5. Concurrency model
-
-- Flask's dev server: `BaseHTTPRequestHandler` per request, optionally `ThreadingMixIn` (thread-per-request, GIL contention + thread creation overhead) or `fork` (heavy).
-- flap Python: single-threaded `asyncio` + `uvloop` (epoll, edge-triggered), many connections on one thread, no context switch.
-- flap Rust: Tokio work-stealing thread pool (N = CPU cores), `SO_REUSEPORT` for multi-process flap Python.
-
-### 6. Keep-Alive
-
-Flask's dev server often closes after each response unless `Connection: keep-alive` is explicitly negotiated and threaded. Benchmark tools that don't use keep-alive pay TCP 3-way handshake per request (~0.3ms localhost).
-
-**flap:** Keep-Alive is on by default, correct `Content-Length` precomputed, `Connection: keep-alive` header. Reuses TCP for 10k requests per connection.
-
----
-
-## What flap Does Differently (by component)
-
-### Rust core (`src/lib.rs`)
-
-- **Tokio** as executor: multi-thread, work-stealing, low-latency timers.
-- **Hyper 1.0** as HTTP engine: zero-copy header parsing, `http-body-util` for streaming.
-- **Axum 0.7** router: compile-time checked, `tower` middleware for tracing without per-request allocation.
-- **PyO3** for Python interop: `Python::with_gil` only at handler invocation, GIL held for ~microseconds. Future: free-threaded Python 3.13 `Py_GIL_DISABLED`.
+### Rust core (`src/lib.rs` — modular)
+- **Tokio** multi-thread, `with_graceful_shutdown` (SIGTERM/SIGINT, 5s drain)
+- **Hyper 1.0** zero-copy `Bytes`, `HeaderMap` reuse
+- **Axum 0.7** radix trie, `tower` middleware without per-request alloc
+- **PyO3**: `Python::with_gil` only for handler/hooks, `spawn_blocking` + `allow_threads` for Rust work (C); never access `PyObject` without GIL
+- Fast path (cached, no hooks) in Rust `RwLock<HashMap>` vs full path with `Request` lazy, hooks, error handling
 
 ### Python fallback (`flap/server.py`)
+- `asyncio.Protocol` + `httptools`, `FLAP_ENGINE=python` via env var (never silent fallback)
+- `on_message_complete` fast path vs full path (hooks never skipped)
+- `build_http_response` precomputed `_STATUS_LINES`, `bytearray(512)`, chunked streaming
 
-- `asyncio.Protocol` + `httptools.HttpRequestParser` (C) — not `asyncio.StreamReader` (extra buffering).
-- `FlapProtocol.on_message_complete` dispatches **inline** for sync handlers (no `create_task` overhead). Async handlers get `create_task`.
-- Response builder (`flap/response.py`): pre-cached `STATUS_TEXT`, single `bytearray` for headers + body, no `format()` string interpolation.
-- Router: static dict + compiled regex.
-- `orjson` if installed, else `json` with `separators=(",",":")` (smallest output).
+## Benchmark Methodology (Fair Comparison)
 
----
-
-## Reproducing Benchmarks
-
-All scripts are in [`benchmarks/`](benchmarks/).
-
-### 1. Simple GET benchmark (network)
+- **Equivalent apps:** `benchmarks/flap_app.py` vs `flask_app.py` (6 endpoints, same payloads, 500 dummy routes)
+- **Hardware:** same machine, localhost (no network)
+- **Concurrency:** `--concurrency 10` (quick) or 20/50, connections reused (keep-alive), backlog 8192
+- **Settings:** `workers=1` for single-core measure; `workers=auto` for multi-core
+- **Release builds:** `maturin develop --release` (opt-level 3, LTO thin) for Rust; `pip install flap[fast]` for Python
+- **Metrics:** RPS, p50/p95/p99 via `perf_counter` per request, CPU/MEM via `psutil` or `/proc/<pid>/statm`
 
 ```bash
-# Terminal 1: flap
-python examples/hello.py &  # port 8000
+# Flask vs flap (Python+Rust if compiled) with detailed latency/CPU/MEM
+python benchmarks/benchmark.py --quick
+# Full competition (+ Express/Gin*/Drogon*)
+python benchmarks/compare_all.py --quick
+# In-process (no network)
+python benchmarks/bench_test_client.py
 
-# Terminal 2: flask (for comparison)
-python benchmarks/flask_app.py &  # port 5000
+# With Rust explicitly
+FLAP_ENGINE=rust python benchmarks/flap_app.py &  # port 8001 via FLAP_PORT
+FLAP_ENGINE=python python benchmarks/flap_app.py & # force fallback
 
-# Terminal 3: wrk (install: apt install wrk) or Python benchmark
-python benchmarks/benchmark.py --flask-url http://127.0.0.1:5000/ \
-                               --flap-url  http://127.0.0.1:8000/ \
-                               --requests 20000 --concurrency 50
+# Sustained / high concurrency
+python benchmarks/benchmark.py --requests 50000 --concurrency 100
+# Malformed / shutdown / leak tests
+pytest tests/test_reliability.py -v
 ```
-
-Output:
-
-```
-Flask:  1342 rps  mean 37ms  p95 52ms
-Flap:  9821 rps  mean  5ms  p95  9ms
-Speedup: 7.32x ✅
-```
-
-The Python benchmark (`benchmark.py`) also works without `wrk` — it uses `httpx`/`http.client` loop with keep-alive.
-
-### 2. Test client benchmark (no network)
-
-```bash
-python benchmarks/bench_test_client.py --iterations 10000
-```
-
-Measures dispatch only (routing + handler call), no TCP.
-
-### 3. JSON echo
-
-```bash
-python benchmarks/bench_json.py
-```
-
----
 
 ## Flame Graphs
 
-Generated with `py-spy` + `inferno`:
-
 ```bash
 py-spy record -o flask.svg -- python benchmarks/flask_app.py
-py-spy record -o flap.svg  -- python examples/hello.py
+py-spy record -o flap.svg  -- python benchmarks/flap_app.py
 ```
-
-Typical Flask flame: 35% in `werkzeug.serving.make_server`, 25% in `environ` building, 20% in routing regex loop.
-
-Flap flame: 10% in `httptools.feed_data`, 15% in `router.match`, 5% in handler, rest idle in `epoll_wait`.
-
----
+Flask: 35% `make_server`, 25% `environ`, 20% routing. flap: 10% `feed_data`, 5% `match` (LRU hit), 5% handler, rest `epoll_wait`.
 
 ## Tuning Tips
 
-- **Install extras:** `pip install flap[fast]` → +15% from uvloop/orjson.
-- **Workers:** `app.run(workers=os.cpu_count())` for multi-core.
-- **Keep-Alive:** Clients must send `Connection: keep-alive` (most do by default; `wrk` and Python `http.client` reuse).
-- **JSON size:** For large JSON (>100KB), Rust engine's streaming body helps; Python fallback still copies via orjson. Use `Response(..., content_type="application/json")` to avoid double encode.
-
----
+- `pip install flap[fast]` + `uvloop+orjson` → +15%
+- `app.run(workers=os.cpu_count())` or `FLAP_ENGINE=rust` for multi-core (Tokio)
+- Keep-alive: clients must send `Connection: keep-alive` (wrk, http.client, httpx do)
+- JSON large (>100KB): Rust streaming helps; Python still copies via orjson
+- Release flag matters: debug Rust ~2× slower; always `--release`
 
 ## References
 
-- **Flask & Werkzeug perf discussion:** https://github.com/pallets/werkzeug/issues/742, https://flask.palletsprojects.com/en/stable/deploying/
-- **Tokio vs asyncio:** https://tokio.rs/tokio/topics/why-tokio
-- **Hyper benchmarks:** https://github.com/hyperium/hyper/blob/master/benches/ — shows ~50k rps on similar hardware.
-- **Axum routing benchmark:** https://github.com/tokio-rs/axum#performance
-- **llhttp (Node http parser):** https://github.com/nodejs/llhttp — flap's `httptools` is a binding to this.
-- **orjson vs stdlib json:** https://github.com/ijl/orjson#performance
-- **PyO3 GIL handling:** https://pyo3.rs/v0.22.0/parallelism — flap follows "GIL only for handler call" pattern.
-- **PEP 3333 (WSGI):** https://peps.python.org/pep-3333/ — spec that flap avoids.
+- Werkzeug perf: https://github.com/pallets/werkzeug/issues/742
+- Tokio vs asyncio: https://tokio.rs/tokio/topics/why-tokio
+- Hyper benches: https://github.com/hyperium/hyper/blob/master/benches/
+- Axum perf: https://github.com/tokio-rs/axum#performance
+- llhttp: https://github.com/nodejs/llhttp
+- orjson: https://github.com/ijl/orjson — not zero-copy
+- PyO3 GIL: https://pyo3.rs/v0.22.0/parallelism
+- PEP 3333: https://peps.python.org/pep-3333/

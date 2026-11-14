@@ -1,5 +1,6 @@
-"""Flap app mirroring flask_app.py for benchmarking"""
+"""Flap app mirroring flask_app.py for benchmarking - identical routes for fair comparison"""
 from flap import Flap
+import os
 
 ITEMS_3K = list(range(3000))
 
@@ -28,7 +29,7 @@ def search(req):
 
 @app.get("/json", cache=True)
 def json_route(req):
-    # Large JSON to demonstrate orjson (Rust) vs Python json (5x)
+    # Large JSON to demonstrate orjson (Rust) vs Python json
     return {"message": "hello", "items": ITEMS_3K, "nested": {"a": "b", "count": 3000}}
 
 # Add many dummy routes - flap uses O(1) hash map, Flask scans regex list
@@ -38,4 +39,8 @@ for i in range(500):
         return f"dummy {i}"
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000, workers=1)
+    # Support FLAP_PORT env var for competition harness (flap_rust on 8001)
+    port = int(os.getenv("FLAP_PORT", os.getenv("PORT", "8000")))
+    host = os.getenv("FLAP_HOST", "127.0.0.1")
+    # FLAP_ENGINE is handled inside app.run() (rust default, python fallback)
+    app.run(host=host, port=port, workers=1)
