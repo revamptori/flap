@@ -1,4 +1,4 @@
-from typing import Dict, Any, Union, Optional, Tuple
+from typing import Dict, Any, Union, Optional, Tuple, Iterable, Generator
 try:
     import orjson as _orjson
     _HAS_ORJSON = True
@@ -83,6 +83,10 @@ def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optiona
     """
     Convert handler return value into canonical tuple (status, headers, body_bytes, content_type)
     Optimized: fast-path for common str/bytes/dict without tuple check.
+    Bottleneck D/F: uses orjson (Rust) where available, minimizes allocations, no zero-copy claim.
+
+    Streaming: if handler returns a generator/iterator yielding str/bytes, caller should treat specially
+               and not call this directly; instead iterate chunks. This function will stringify it.
     """
     # Fast path: most handlers return str/dict/bytes directly (no tuple)
     # Check Response first (rare)
@@ -100,12 +104,20 @@ def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optiona
     if isinstance(result, bytes):
         return 200, {}, result, None
     if isinstance(result, (dict, list)):
+        # Bottleneck D: JSON via orjson (Rust) if available, else stdlib json.
+        # Not zero-copy: orjson dumps allocates new bytes; we document this.
+        # Future: Rust engine could use serde_json directly to avoid Python->Rust copy.
         if _HAS_ORJSON:
             return 200, {}, _orjson.dumps(result), "application/json"
         else:
             return 200, {}, json.dumps(result, separators=(",", ":")).encode("utf-8"), "application/json"
     if result is None:
         return 200, {}, b"", "text/plain; charset=utf-8"
+
+    # Streaming check: generator or iterable of chunks (but not str/bytes/dict already handled)
+    # Flask-like streaming: handler yields strings/bytes incrementally.
+    # We detect iterable but treat as error if not explicitly handled; streaming is handled at server layer.
+    # Here we just stringify fallback.
 
     # Tuple unpack for (body, status) or (body, status, headers)
     status = 200
@@ -143,8 +155,40 @@ def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optiona
                 return status, headers, json.dumps(body, separators=(",", ":")).encode("utf-8"), "application/json"
         if body is None:
             return status, headers, b"", "text/plain; charset=utf-8"
+        # Check if body is streaming generator - handled by caller
+        if hasattr(body, "__iter__") and not isinstance(body, (str, bytes, dict, list)):
+            # Defer to streaming path: caller will handle iteration
+            # For normalize_response fallback, we collect
+            chunks = []
+            for chunk in body:
+                if isinstance(chunk, str):
+                    chunks.append(chunk.encode("utf-8"))
+                elif isinstance(chunk, bytes):
+                    chunks.append(chunk)
+                else:
+                    chunks.append(str(chunk).encode("utf-8"))
+            return status, headers, b"".join(chunks), "text/plain; charset=utf-8"
         # fallback stringify
         return status, headers, str(body).encode("utf-8"), "text/plain; charset=utf-8"
+
+    # Handle generator/streaming returned directly (not in tuple)
+    if hasattr(result, "__iter__") and not isinstance(result, (str, bytes, dict)):
+        # Could be generator
+        try:
+            # Peek if it's generator-like
+            it = iter(result)
+            # If it quacks like generator, collect
+            chunks = []
+            for chunk in it:
+                if isinstance(chunk, str):
+                    chunks.append(chunk.encode("utf-8"))
+                elif isinstance(chunk, bytes):
+                    chunks.append(chunk)
+                else:
+                    chunks.append(str(chunk).encode("utf-8"))
+            return 200, {}, b"".join(chunks), "text/plain; charset=utf-8"
+        except Exception:
+            pass
 
     # Fallback stringify for int etc.
     return 200, {}, str(result).encode("utf-8"), "text/plain; charset=utf-8"
@@ -161,6 +205,14 @@ def build_http_response(
     """
     Build raw HTTP/1.1 response bytes. Highly optimized: uses precomputed status texts,
     minimal allocations, and avoids per-request formatting overhead where possible.
+
+    Bottleneck F: minimize allocations and intermediate Python objects.
+    - Uses precomputed _STATUS_LINES (no str(status) per request)
+    - Single bytearray(512) pre-allocated, cleared per request (reused buffer pattern)
+    - Direct bytes header writes, no intermediate dict merging unless needed
+    - Body is appended once at end (no chunked reallocation for small bodies)
+
+    Note: For streaming, caller should use chunked encoding instead of this helper.
     """
     # Use precomputed status line if available (fast path)
     status_line = _STATUS_LINES.get(status)
@@ -228,4 +280,52 @@ def build_http_response(
     # Body
     if body:
         buf.extend(body)
+    return bytes(buf)
+
+
+def build_http_response_headers_only(
+    status: int,
+    headers: Dict[str, str],
+    content_length: int | None,
+    content_type: Optional[str],
+    keep_alive: bool = True,
+) -> bytes:
+    """
+    Build HTTP headers without body (for streaming). Caller writes chunks separately.
+    Used for streaming responses (generator). Content-Length may be None -> chunked.
+    """
+    status_line = _STATUS_LINES.get(status)
+    buf = bytearray(256)
+    buf.clear()
+    if status_line is not None:
+        buf.extend(status_line)
+    else:
+        reason = _status_text(status)
+        buf.extend(b"HTTP/1.1 ")
+        buf.extend(str(status).encode())
+        buf.extend(b" ")
+        buf.extend(reason)
+        buf.extend(b"\r\n")
+    has_ct = any(k.lower() == "content-type" for k in headers)
+    if not has_ct and content_type:
+        buf.extend(b"Content-Type: ")
+        buf.extend(content_type.encode())
+        buf.extend(b"\r\n")
+    if content_length is not None:
+        buf.extend(b"Content-Length: ")
+        buf.extend(str(content_length).encode())
+        buf.extend(b"\r\n")
+    else:
+        buf.extend(b"Transfer-Encoding: chunked\r\n")
+    if keep_alive:
+        buf.extend(b"Connection: keep-alive\r\n")
+    else:
+        buf.extend(b"Connection: close\r\n")
+    buf.extend(b"Server: flap\r\n")
+    for k, v in headers.items():
+        buf.extend(k.encode())
+        buf.extend(b": ")
+        buf.extend(v.encode() if isinstance(v, str) else str(v).encode())
+        buf.extend(b"\r\n")
+    buf.extend(b"\r\n")
     return bytes(buf)

@@ -8,7 +8,8 @@ except ImportError:
     _json_lib = _json_lib  # keep alias
 
 import json
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
+from http.cookies import SimpleCookie
 
 class Request:
     """
@@ -23,8 +24,15 @@ class Request:
         body: raw request body as bytes
         params: path parameters extracted by router (e.g., {"id": "123"})
         ip: client ip if available
+
+    Lazy properties (Bottleneck B):
+        - query / query_all: only parsed when accessed, cached
+        - json(): only parsed when called, cached
+        - form(): only parsed when called
+        - cookies: only parsed when accessed
+        Headers are stored as bytes->bytes by server for speed; decoded lazily.
     """
-    __slots__ = ("method", "path", "query_string", "_query", "_query_all", "headers", "body", "params", "ip", "_json_cache", "_form_cache")
+    __slots__ = ("method", "path", "query_string", "_query", "_query_all", "headers", "body", "params", "ip", "_json_cache", "_form_cache", "_cookies_cache", "_raw_body_ref")
 
     def __init__(
         self,
@@ -47,6 +55,8 @@ class Request:
         self.ip = ip
         self._json_cache = None
         self._form_cache = None
+        self._cookies_cache: Optional[Dict[str, str]] = None
+        self._raw_body_ref = None  # for optimization: keep original bytes ref for echo fast path
 
     @property
     def query(self) -> Dict[str, str]:
@@ -71,6 +81,29 @@ class Request:
         self._query_all = parsed
         # flatten to first value
         self._query = {k: v[0] if v else "" for k, v in parsed.items()}
+
+    @property
+    def cookies(self) -> Dict[str, str]:
+        """Lazy cookie parsing from Cookie header. Only parsed when accessed (Bottleneck B)."""
+        if self._cookies_cache is not None:
+            return self._cookies_cache
+        raw = self.header("cookie")
+        if not raw:
+            self._cookies_cache = {}
+            return self._cookies_cache
+        try:
+            c = SimpleCookie()
+            c.load(raw)
+            self._cookies_cache = {k: v.value for k, v in c.items()}
+        except Exception:
+            # Fallback simple split
+            d: Dict[str, str] = {}
+            for part in raw.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    d[unquote(k.strip())] = unquote(v.strip())
+            self._cookies_cache = d
+        return self._cookies_cache
 
     def json(self, **kwargs) -> Any:
         """Parse body as JSON. Uses orjson if available (Rust-fast)."""
@@ -113,7 +146,7 @@ class Request:
         # Fallback: bytes key (from optimized server)
         try:
             bkey = key.encode("latin1")
-            val2 = self.headers.get(bkey, None)
+            val2 = self.headers.get(bkey, None)  # type: ignore
             if val2 is not None:
                 return val2.decode("latin1", errors="ignore") if isinstance(val2, bytes) else val2
         except:
@@ -122,9 +155,9 @@ class Request:
 
     def _get_raw_header(self, name: bytes) -> Optional[str]:
         # Internal fast bytes lookup
-        val = self.headers.get(name, None)
+        val = self.headers.get(name, None)  # type: ignore
         if val is None:
-            val = self.headers.get(name.lower(), None)
+            val = self.headers.get(name.lower(), None)  # type: ignore
         if isinstance(val, bytes):
             return val.decode("latin1", errors="ignore")
         return val

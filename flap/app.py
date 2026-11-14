@@ -1,8 +1,8 @@
 from typing import Callable, List, Optional, Dict, Any
 from .router import Router
-from .server import run_sync
 from .test_client import TestClient
 import inspect
+import os
 
 class Flap:
     """
@@ -46,6 +46,12 @@ class Flap:
         @app.after_request
         def after(req, status, headers, body): ...
 
+    Engine selection:
+        FLAP_ENGINE env var controls execution engine:
+            FLAP_ENGINE=rust   -> require Rust (hyper+tokio), fail if unavailable (never silent fallback)
+            FLAP_ENGINE=python -> use Python fallback (httptools+uvloop)
+            FLAP_ENGINE=auto   -> default: Rust if compiled else Python (default is Rust-first)
+        app.run(engine="rust"/"python") can override env var.
     """
 
     def __init__(self, import_name: str = __name__, debug: bool = False):
@@ -105,7 +111,7 @@ class Flap:
         return fn
 
     # ---- Running ----
-    def run(self, host: str = "127.0.0.1", port: int = 8000, workers: int = 1, debug: Optional[bool] = None, **kwargs):
+    def run(self, host: str = "127.0.0.1", port: int = 8000, workers: int = 1, debug: Optional[bool] = None, engine: Optional[str] = None, **kwargs):
         """
         Start the flap server.
 
@@ -114,43 +120,49 @@ class Flap:
             port: Bind port (default 8000)
             workers: Number of worker processes (prefork). Use 1 for single process (default).
             debug: Enable debug logging (overrides constructor debug)
+            engine: Execution engine override: "rust", "python", or None (use FLAP_ENGINE env var, default Rust)
+                    Never silently falls back — if selected engine is unavailable, raises.
         """
         if debug is not None:
             self.debug = debug
 
-        # Try Rust core first
-        try:
+        # Resolve engine: explicit arg > FLAP_ENGINE env var > auto (rust default)
+        from . import _RUST_AVAILABLE, _resolve_engine
+
+        # _resolve_engine handles ValueError for invalid values
+        resolved = _resolve_engine(engine)
+
+        if resolved == "rust":
+            if not _RUST_AVAILABLE:
+                raise RuntimeError(
+                    "FLAP_ENGINE=rust selected but Rust extension not available. "
+                    "Build with `maturin develop --release` or set FLAP_ENGINE=python to use Python fallback."
+                )
+            # Use Rust engine - never silent fallback
             from . import _flap as _rust
-            if hasattr(_rust, "run"):
-                # Rust signature: _flap.run(router_data, host, port, workers)
-                # But we need to convert router to rust representation.
-                # For now, our Python fallback is the primary documented method.
-                # Rust core is invoked via the same router data if available.
-                print(f" * Flap running on http://{host}:{port}/ (Rust engine)")
-                # Build simple route table for Rust (list of tuples)
-                # Note: Rust engine will handle routing natively for speed.
-                # We will attempt to delegate, but if it fails, fallback.
-                try:
-                    # Prepare serializable routes: [(path, methods, handler_id)] but Rust needs python callbacks
-                    # Our Rust extension would hold Python callables via PyO3.
-                    # We will call _rust.run with host/port and a dispatcher closure.
-                    # Implementation detail is abstracted in extension; we pass router object.
-                    # If Rust build supports it, it will use hyper+tokio.
-                    _rust.run(self.router, host, port, workers)  # type: ignore
-                    return
-                except Exception as e:
-                    print(f"   Rust engine failed ({e}), falling back to Python engine")
-        except ImportError:
-            pass
-        except Exception:
+            if not hasattr(_rust, "run"):
+                raise RuntimeError("Rust extension present but missing `run` entrypoint")
+            print(f" * Flap running on http://{host}:{port}/ (Rust engine: tokio+hyper+axum) | Workers: {workers} | Routes: {len(self.router.all_routes)}")
+            # Pass entire app (router + hooks) so Rust can handle middleware correctly.
+            # Backwards compat: _rust.run historically accepted router; now we pass app.
+            # Rust extractor detects both shapes.
+            _rust.run(self, host, port, workers)  # type: ignore
+            return
+
+        # Python fallback (explicit or auto when Rust unavailable)
+        if resolved == "python" and _RUST_AVAILABLE and engine is None:
+            # User explicitly requested python via env var - respect it and log
             pass
 
-        # Python fallback
+        from .server import run_sync
         run_sync(self.router, host=host, port=port, before_hooks=self._before_hooks, after_hooks=self._after_hooks, workers=workers)
 
     # ---- Testing ----
-    def test_client(self):
-        """Return a TestClient for in-process testing (no network)."""
+    def test_client(self, engine: Optional[str] = None):
+        """Return a TestClient for in-process testing (no network).
+        Engine param is accepted for symmetry but test client always uses Python Router logic
+        so behavior is comparable across engines. Use `FLAP_ENGINE` to test server engines.
+        """
         return TestClient(self.router, self._before_hooks, self._after_hooks)
 
     # ---- Introspection helpers ----

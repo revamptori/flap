@@ -1,3 +1,12 @@
+"""
+Router with precompiled routes for performance.
+
+Bottleneck E: Routing is optimized:
+- Routes are precompiled at startup (compile_path called in Route.__init__, not per request)
+- Static routes: O(1) hash lookup via dict[(method,path)]
+- Dynamic routes: precompiled regex, extracted only if static miss; hot paths cached via lru_cache(2048)
+- No per-request regex compilation or introspection (inspect.signature at registration)
+"""
 import re
 import functools
 from typing import Callable, Dict, List, Tuple, Optional, Pattern, Any
@@ -17,6 +26,7 @@ def compile_path(path: str) -> Tuple[Pattern, List[str], Dict[str, str]]:
     Compile a Flask-style path pattern into a regex.
     Returns (regex, param_names, param_types).
     Example: "/user/<int:id>/post/<path:rest>" -> regex with named groups
+    Called once at startup, never per request (Bottleneck E).
     """
     param_names: List[str] = []
     param_types: Dict[str, str] = {}
@@ -43,21 +53,22 @@ def compile_path(path: str) -> Tuple[Pattern, List[str], Dict[str, str]]:
 
 
 class Route:
-    __slots__ = ("path", "methods", "handler", "cache", "is_dynamic", "regex", "param_names", "param_types", "_prebuilt", "needs_request")
+    __slots__ = ("path", "methods", "handler", "cache", "is_dynamic", "regex", "param_names", "param_types", "_prebuilt", "needs_request", "is_coroutine")
     def __init__(self, path: str, methods: List[str], handler: Callable, cache: bool = False):
         self.path = path
         self.methods = set(m.upper() for m in methods)
         self.handler = handler
         self.cache = cache
         self._prebuilt = None
-        # Inspect handler signature to see if it needs Request (fast-path: no Request alloc if handler has 0 args)
+        # Inspect handler signature once at startup (Bottleneck E: avoid per-request introspection)
         try:
             import inspect
             sig = inspect.signature(handler)
-            # handler(req, ...) -> first param is req; if no params, we can skip Request creation for cached static
             self.needs_request = len(sig.parameters) > 0
+            self.is_coroutine = inspect.iscoroutinefunction(handler)
         except Exception:
             self.needs_request = True
+            self.is_coroutine = False
         # detect if dynamic or static
         self.is_dynamic = "<" in path
         if self.is_dynamic:
@@ -91,6 +102,7 @@ class Route:
 class Router:
     """
     High-performance router with O(1) static lookup + ordered dynamic fallback.
+    Precompiled at startup; no repeated regex compilation (Bottleneck E).
     """
     def __init__(self):
         # static_routes: {(method, path): Route}
@@ -123,7 +135,7 @@ class Router:
 
     @functools.lru_cache(maxsize=2048)
     def match(self, method: str, path: str) -> Tuple[Optional[Callable], Optional[Dict[str, Any]]]:
-        # Fast path: static
+        # Fast path: static O(1) hash
         key = (method, path)
         route = self.static_routes.get(key)
         if route is not None:
