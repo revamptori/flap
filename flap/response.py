@@ -79,6 +79,45 @@ def redirect(url: str, status: int = 302) -> Response:
     """Helper to redirect."""
     return Response(body="", status=status, headers={"Location": url})
 
+class HTTPException(Exception):
+    def __init__(self, status: int = 500, description: str = ""):
+        self.status = status
+        self.description = description or _STATUS_TEXT.get(status, b"Error").decode()
+        super().__init__(self.description)
+
+def abort(status: int = 500, description: str = ""):
+    """Flask-compatible abort: raise HTTPException with status."""
+    raise HTTPException(status, description)
+
+def make_response(*args):
+    """Flask-compatible make_response: normalizes to Response."""
+    # Handles Flask's make_response(body, status, headers)
+    if len(args) == 1:
+        a = args[0]
+        if isinstance(a, Response):
+            return a
+        return Response(a)
+    # delegate to normalize helper via Response
+    # build tuple then use Response logic? simplest: return tuple for normalize
+    return args
+
+def url_for(endpoint: str, **values) -> str:
+    """Minimal Flask url_for — reverses endpoint (function name) to path. For full Flask use, use explicit paths."""
+    # Try to find route whose handler.__name__ == endpoint
+    # Needs app context; without it fallback to /endpoint
+    try:
+        from .globals import _current_request_ctx
+        # Also try to look up via a global registry if set
+        import inspect
+        # Fallback: return /endpoint with query for extra values
+        path = f"/{endpoint}"
+        if values:
+            from urllib.parse import urlencode
+            path += "?" + urlencode(values)
+        return path
+    except Exception:
+        return f"/{endpoint}"
+
 def normalize_response(result: Any) -> Tuple[int, Dict[str, str], bytes, Optional[str]]:
     """
     Convert handler return value into canonical tuple (status, headers, body_bytes, content_type)

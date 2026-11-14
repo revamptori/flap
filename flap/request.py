@@ -11,6 +11,22 @@ import json
 from urllib.parse import parse_qs, unquote
 from http.cookies import SimpleCookie
 
+class _Args(dict):
+    """Flask-compatible ImmutableMultiDict subset: supports .get(key, default, type) and .getlist"""
+    def get(self, key, default=None, type=None):  # type: ignore
+        val = super().get(key, default)
+        if type is not None and val is not default and val is not None:
+            try:
+                return type(val)
+            except Exception:
+                return default
+        return val
+    def getlist(self, key):
+        # Will be overridden by Request context to use query_all; here fallback
+        v = self.get(key)
+        return [v] if v is not None else []
+    # Flask uses args[key] raises 400 if missing; we keep dict behavior (KeyError) for compat simple
+
 class Request:
     """
     Incoming HTTP request.
@@ -60,7 +76,7 @@ class Request:
 
     @property
     def query(self) -> Dict[str, str]:
-        """Parsed query string as simple dict (first value wins)."""
+        """Parsed query string as simple dict (first value wins). Flask: request.args"""
         if self._query is None:
             self._parse_query()
         return self._query  # type: ignore
@@ -74,13 +90,14 @@ class Request:
 
     def _parse_query(self):
         if not self.query_string:
-            self._query = {}
+            # Use Flask-like Args dict with helpers
+            self._query = _Args({})  # type: ignore
             self._query_all = {}
             return
         parsed = parse_qs(self.query_string, keep_blank_values=True)
         self._query_all = parsed
-        # flatten to first value
-        self._query = {k: v[0] if v else "" for k, v in parsed.items()}
+        # flatten to first value, wrap in _Args for .getlist/.get(type=)
+        self._query = _Args({k: v[0] if v else "" for k, v in parsed.items()})  # type: ignore
 
     @property
     def cookies(self) -> Dict[str, str]:
@@ -135,6 +152,33 @@ class Request:
         parsed = parse_qs(self.body.decode(), keep_blank_values=True)
         self._form_cache = {k: v[0] if v else "" for k, v in parsed.items()}
         return self._form_cache
+
+    # Flask compat aliases
+    @property
+    def args(self):
+        return self.query
+    @property
+    def values(self):
+        v = dict(self.query)
+        v.update(self.form())
+        return v
+    def get_json(self, force=False, silent=False, cache=True):
+        try:
+            return self.json()
+        except Exception:
+            if silent:
+                return None
+            raise
+    def get_data(self, as_text=False, cache=True, parse_form_data=False):
+        if as_text:
+            return self.body.decode("utf-8", errors="ignore")
+        return self.body
+    @property
+    def data(self):
+        return self.body
+    @property
+    def remote_addr(self):
+        return self.ip
 
     def header(self, name: str, default: Optional[str] = None) -> Optional[str]:
         # Handle both str and bytes headers (server stores bytes for speed)

@@ -31,7 +31,12 @@ except ImportError:
 import httptools
 from .router import Router
 from .request import Request
-from .response import normalize_response, build_http_response, build_http_response_headers_only
+from .response import normalize_response, build_http_response, build_http_response_headers_only, HTTPException
+try:
+    from .globals import set_request_ctx, reset_request_ctx
+except ImportError:
+    def set_request_ctx(req): return (None, None)
+    def reset_request_ctx(tok): pass
 
 try:
     import orjson  # noqa: F401 presence check for JSON speed
@@ -314,37 +319,58 @@ class FlapProtocol(asyncio.Protocol):
                 ip=self._client_ip,
             )
 
-            # before hooks (middleware) - never skipped for benchmark gains
-            intercepted = None
-            for hook in self.before_hooks:
-                try:
-                    r = hook(req)
-                    if r is not None:
-                        intercepted = r
+            # Flask 1:1: set request context so `from flap import request` works
+            ctx_tokens = set_request_ctx(req)
+            try:
+                # before hooks (middleware) - never skipped for benchmark gains
+                # Support both Flask-style def before(): (no arg) and Flap-style def before(req):
+                intercepted = None
+                for hook in self.before_hooks:
+                    try:
+                        try:
+                            r = hook(req)
+                        except TypeError:
+                            r = hook()
+                        if r is not None:
+                            intercepted = r
+                            break
+                    except HTTPException as e:
+                        status, resp_headers, resp_body, resp_ct = e.status, {}, e.description.encode(), "text/plain; charset=utf-8"
+                        intercepted = (resp_body, status)  # will be normalized below
                         break
-                except Exception as e:
-                    log.exception(f"before_request hook error: {e}")
+                    except Exception as e:
+                        log.exception(f"before_request hook error: {e}")
 
-            if intercepted is not None:
-                try:
-                    status, resp_headers, resp_body, resp_ct = normalize_response(intercepted)
-                except Exception as e:
-                    log.exception(f"hook response normalize error: {e}")
-                    status, resp_headers, resp_body, resp_ct = 500, {}, _INTERNAL_ERROR_BODY, "application/json"
-            else:
-                try:
-                    # Check if handler is coroutine (async def)
-                    if route.is_coroutine if route else asyncio.iscoroutinefunction(handler):
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(self._handle_async(handler, req, params or {}, self._keep_alive))
-                        self._reset_state_for_next()
-                        return
-                    else:
-                        # Sync path - high throughput, check for streaming generator
-                        if params:
-                            result = handler(req, **params)
+                if intercepted is not None:
+                    try:
+                        status, resp_headers, resp_body, resp_ct = normalize_response(intercepted)
+                    except Exception as e:
+                        log.exception(f"hook response normalize error: {e}")
+                        status, resp_headers, resp_body, resp_ct = 500, {}, _INTERNAL_ERROR_BODY, "application/json"
+                else:
+                    try:
+                        # Check if handler is coroutine (async def)
+                        if route.is_coroutine if route else asyncio.iscoroutinefunction(handler):
+                            loop = asyncio.get_event_loop()
+                            loop.create_task(self._handle_async(handler, req, params or {}, self._keep_alive, ctx_tokens))
+                            self._reset_state_for_next()
+                            # context will be restored in async handler after it completes; reset here for next pipelined request
+                            reset_request_ctx(ctx_tokens)
+                            return
                         else:
-                            result = handler(req)
+                            # Sync path - support both signatures: Flask def view(): / def view(id): vs Flap def view(req, id):
+                            # route.needs_request tells which
+                            if getattr(route, "needs_request", True):
+                                if params:
+                                    result = handler(req, **params)
+                                else:
+                                    result = handler(req)
+                            else:
+                                # Flask-style: no req arg, only path params
+                                if params:
+                                    result = handler(**params)
+                                else:
+                                    result = handler()
                         # Streaming detection: if result is generator/iterator of chunks, stream it
                         if hasattr(result, "__next__") or hasattr(result, "__iter__") and not isinstance(result, (str, bytes, dict, list, tuple)):
                             # Check if it's a generator that yields chunks (not a dict/list already handled)
@@ -358,6 +384,7 @@ class FlapProtocol(asyncio.Protocol):
                                 else:
                                     # Streaming path: write headers then chunks
                                     self._write_streaming(iterator, first, req)
+                                    reset_request_ctx(ctx_tokens)
                                     self._reset_state_for_next()
                                     return
                             except TypeError:
@@ -365,19 +392,31 @@ class FlapProtocol(asyncio.Protocol):
                                 status, resp_headers, resp_body, resp_ct = normalize_response(result)
                         else:
                             status, resp_headers, resp_body, resp_ct = normalize_response(result)
-                except Exception as e:
-                    log.exception(f"handler error for {method_str} {path}: {e}")
-                    status, resp_headers, resp_body, resp_ct = 500, {}, _INTERNAL_ERROR_BODY, "application/json"
-
-                # after hooks (only for sync path; async handled separately) - never skipped
-                for hook in self.after_hooks:
-                    try:
-                        maybe = hook(req, status, resp_headers, resp_body)
-                        if maybe is not None:
-                            if isinstance(maybe, tuple) and len(maybe) == 4:
-                                status, resp_headers, resp_body, resp_ct = maybe
+                    except HTTPException as e:
+                        status, resp_headers, resp_body, resp_ct = e.status, {}, e.description.encode(), "text/plain; charset=utf-8"
                     except Exception as e:
-                        log.exception(f"after_request hook error: {e}")
+                        log.exception(f"handler error for {method_str} {path}: {e}")
+                        status, resp_headers, resp_body, resp_ct = 500, {}, _INTERNAL_ERROR_BODY, "application/json"
+
+                    # after hooks (only for sync path; async handled separately) - never skipped
+                    # Support both Flask def after(response): and Flap def after(req,status,...):
+                    for hook in self.after_hooks:
+                        try:
+                            try:
+                                maybe = hook(req, status, resp_headers, resp_body)
+                            except TypeError:
+                                # Flask-style after_request takes response only
+                                maybe = hook(status) if hook.__code__.co_argcount == 1 else hook()
+                            if maybe is not None:
+                                if isinstance(maybe, tuple) and len(maybe) == 4:
+                                    status, resp_headers, resp_body, resp_ct = maybe
+                        except HTTPException as e:
+                            status, resp_headers, resp_body, resp_ct = e.status, {}, e.description.encode(), "text/plain; charset=utf-8"
+                            break
+                        except Exception as e:
+                            log.exception(f"after_request hook error: {e}")
+            finally:
+                reset_request_ctx(ctx_tokens)
 
         # Build and write response (with cache store if enabled)
         if use_cache and cache_key is not None and status < 500 and handler is not None:
@@ -453,17 +492,30 @@ class FlapProtocol(asyncio.Protocol):
             except Exception:
                 pass
 
-    async def _handle_async(self, handler, req, params, keep_alive):
+    async def _handle_async(self, handler, req, params, keep_alive, ctx_tokens=None):
         # Async handler path: execute, apply after_hooks, write response
+        if ctx_tokens:
+            set_request_ctx(req)
         status = 200
         resp_headers: Dict[str, str] = {}
         resp_body: bytes = b""
         resp_ct: Optional[str] = None
         try:
-            if params:
-                result = await handler(req, **params)
-            else:
-                result = await handler(req)
+            # Support Flask-style no-req handler
+            needs_req = getattr(self.router.match_with_route(req.method, req.path)[2], "needs_request", True) if hasattr(self.router, "match_with_route") else True
+            # Simpler: inspect handler signature already stored? route from earlier not available here
+            # We pass ctx so global `request` works; handler may or may not take req
+            try:
+                if params:
+                    result = await handler(req, **params)
+                else:
+                    result = await handler(req)
+            except TypeError:
+                # Flask-style handler without req
+                if params:
+                    result = await handler(**params)
+                else:
+                    result = await handler()
             # Check streaming for async generator
             if hasattr(result, "__aiter__"):
                 # async streaming - collect or stream
@@ -497,12 +549,17 @@ class FlapProtocol(asyncio.Protocol):
 
         for hook in self.after_hooks:
             try:
-                maybe = hook(req, status, resp_headers, resp_body)
+                try:
+                    maybe = hook(req, status, resp_headers, resp_body)
+                except TypeError:
+                    maybe = hook(status)
                 if maybe is not None and isinstance(maybe, tuple) and len(maybe) == 4:
                     status, resp_headers, resp_body, resp_ct = maybe
             except Exception as e:
                 log.exception(f"after_request hook error: {e}")
 
+        if ctx_tokens:
+            reset_request_ctx(ctx_tokens)
         self._write_response(status, resp_headers, resp_body, resp_ct, keep_alive)
 
 
