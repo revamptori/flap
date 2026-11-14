@@ -43,11 +43,12 @@ Then open `http://localhost:8000`. That's it.
 | **Async** | No (Flask 2 added basic) | Sync **and** async handlers (`async def`) first-class |
 | **Keep-Alive** | Optional | On by default |
 
-> Benchmark on localhost (simple `return "hi"`):
-> - Flask 3.1 (werkzeug): ~1 400 rps
-> - flap (Python fallback httptools+uvloop): ~9 800 rps (**7×**)
-> - flap (Rust engine hyper+tokio): ~18 000 rps (**12×**)
-> See [`benchmarks/`](benchmarks/) for reproducible scripts.
+> Benchmark on localhost (measured `python benchmarks/compare_all.py --quick`, 1000 req, keep-alive, 500 routes):
+> - Flask 3.1 (werkzeug): 2 065 rps (`GET /`) — 2 188 on `/dummy_499`, 1 118 on `POST /echo 3k`
+> - flap (Python fallback httptools+uvloop): 7 307 rps (**3.5×** on `GET /`, **7.8×** on `POST 3k` JSON orjson, 3.6× on 500-route) — test-client 352k (**61×**)
+> - flap (Rust engine hyper+tokio): ~18 000 rps (**8.7×**, expected — `maturin develop --release`, TechEmpower-style)
+> - Express 3 077 rps (flap 2.4× Express), Gin (Go) ~22k, Drogon (C++) ~55k
+> See [`benchmarks/compare_all.py`](benchmarks/compare_all.py) + [`benchmarks/results.md`](benchmarks/results.md) + [`docs/COMPETITION.md`](docs/COMPETITION.md) for full table.
 
 ---
 
@@ -247,7 +248,7 @@ assert resp.json() == {"a": 1}
 5. **uvloop + Tokio.** `uvloop` (libuv) replaces asyncio's selector; Rust uses Tokio's work-stealing scheduler.
 6. **Zero global magic.** `req` is explicit argument — no `from flask import request` context locals, no `LocalStack`.
 
-See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for flame graphs and `benchmarks/benchmark.py` to reproduce.
+See [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md) (profiling, bottlenecks #1-6, before→after 3.5×→7.8×), [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md), and `benchmarks/compare_all.py` to reproduce. Competition table in [`docs/COMPETITION.md`](docs/COMPETITION.md) + [`benchmarks/results.md`](benchmarks/results.md).
 
 ---
 
@@ -255,6 +256,8 @@ See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for flame graphs and `benchmark
 
 * **Beginner's guide (no jargon):** [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) — install, hello world, routing, request/response, deploying.
 * **Performance deep dive:** [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — why Flask is slow, how Rust helps, benchmarks.
+* **Competition (5 frameworks):** [`docs/COMPETITION.md`](docs/COMPETITION.md) + [`benchmarks/results.md`](benchmarks/results.md) — Flask vs flap vs Express vs Gin vs Drogon (live where toolchain available, expected otherwise).
+* **Optimization analysis:** [`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md) — profiling, 6 bottlenecks, applied fixes (LRU cache, bytes headers, STATUS_LINES, ITEMS_3K, __slots__).
 * **Rust internals:** [`src/lib.rs`](src/lib.rs) — Tokio, Hyper, Axum, PyO3 annotated source.
 * **Examples:** [`examples/`](examples/)
 

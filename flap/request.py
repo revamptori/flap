@@ -93,7 +93,7 @@ class Request:
         """Parse body as application/x-www-form-urlencoded"""
         if self._form_cache is not None:
             return self._form_cache
-        ctype = self.headers.get("content-type", "")
+        ctype = self.header("content-type") or ""
         if "application/x-www-form-urlencoded" in ctype:
             parsed = parse_qs(self.body.decode(), keep_blank_values=True)
             self._form_cache = {k: v[0] if v else "" for k, v in parsed.items()}
@@ -104,7 +104,30 @@ class Request:
         return self._form_cache
 
     def header(self, name: str, default: Optional[str] = None) -> Optional[str]:
-        return self.headers.get(name.lower(), default)
+        # Handle both str and bytes headers (server stores bytes for speed)
+        key = name.lower()
+        # Fast path: str headers (original)
+        val = self.headers.get(key, None)
+        if val is not None:
+            return val if isinstance(val, str) else val.decode("latin1", errors="ignore")
+        # Fallback: bytes key (from optimized server)
+        try:
+            bkey = key.encode("latin1")
+            val2 = self.headers.get(bkey, None)
+            if val2 is not None:
+                return val2.decode("latin1", errors="ignore") if isinstance(val2, bytes) else val2
+        except:
+            pass
+        return default
+
+    def _get_raw_header(self, name: bytes) -> Optional[str]:
+        # Internal fast bytes lookup
+        val = self.headers.get(name, None)
+        if val is None:
+            val = self.headers.get(name.lower(), None)
+        if isinstance(val, bytes):
+            return val.decode("latin1", errors="ignore")
+        return val
 
     def __repr__(self):
         return f"<Request {self.method} {self.path}>"

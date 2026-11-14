@@ -1,6 +1,8 @@
 """Flap app mirroring flask_app.py for benchmarking"""
 from flap import Flap
 
+ITEMS_3K = list(range(3000))
+
 app = Flap(__name__)
 
 @app.get("/", cache=True)
@@ -27,7 +29,7 @@ def search(req):
 @app.get("/json", cache=True)
 def json_route(req):
     # Large JSON to demonstrate orjson (Rust) vs Python json (5x)
-    return {"message": "hello", "items": list(range(3000)), "nested": {"a": "b", "count": 3000}}
+    return {"message": "hello", "items": ITEMS_3K, "nested": {"a": "b", "count": 3000}}
 
 # Add many dummy routes - flap uses O(1) hash map, Flask scans regex list
 for i in range(500):

@@ -56,6 +56,7 @@ class FlapProtocol(asyncio.Protocol):
     Each TCP connection gets one protocol instance with its own parser.
     Supports HTTP/1.1 keep-alive and pipelining (sequential processing).
     """
+    __slots__ = ("router", "before_hooks", "after_hooks", "transport", "parser", "_method", "_url", "_headers", "_current_header_name", "_body", "_keep_alive", "_should_close", "_client_ip")
 
     def __init__(self, router: Router, before_hooks, after_hooks):
         self.router = router
@@ -121,15 +122,17 @@ class FlapProtocol(asyncio.Protocol):
         self._url.extend(url)
 
     def on_header(self, name: bytes, value: bytes):
-        # httptools calls on_header for each header pair separately, already split.
-        # name/value are bytes
+        # Optimized: keep headers as bytes->bytes with lowercasing on bytes (no decode per header)
+        # Decode only when req.header() is actually called (lazy). This saves 5 decodes per request.
         try:
-            # Use latin1 to preserve bytes without utf-8 overhead; header values mostly ascii
-            # lowercasing keys for case-insensitive lookup
-            self._headers[name.decode("latin1").lower()] = value.decode("latin1")
+            # bytes.lower() is C-optimized, no decode
+            self._headers[name.lower()] = value  # keep as bytes for now
         except Exception:
-            # fallback ignoring errors
-            self._headers[name.decode(errors="ignore").lower()] = value.decode(errors="ignore")
+            # fallback: try to store raw
+            try:
+                self._headers[name.lower()] = value
+            except:
+                pass
 
     def on_headers_complete(self):
         # Capture method after headers are done (ensures method available)
@@ -146,7 +149,8 @@ class FlapProtocol(asyncio.Protocol):
         method_str = (self._method or b"GET").decode()
         url_bytes = bytes(self._url)
         headers = self._headers
-        body_bytes = bytes(self._body)
+        # Optimized: avoid bytes() copy if body is empty (common for GET)
+        body_bytes = bytes(self._body) if self._body else b""
 
         # Parse URL via httptools.parse_url for speed (C). Fallback to manual split if not available.
         path = "/"
