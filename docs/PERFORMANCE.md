@@ -6,12 +6,12 @@ This document gives hardware-equivalent, concurrency-equivalent numbers with lat
 
 | Workload (3 KB JSON where noted) | Flask 3.1 (Werkzeug) | flap Python (httptools+uvloop+orjson) | flap Rust (hyper+tokio+serde_json) | Speedup Python/Rust |
 |---|---:|---:|---:|---|
-| `GET /` → `"hi"` (lightweight) | 2 150 rps, p95 6ms | 7 500 rps, p95 3ms | 18 000 rps, p95 1ms | **3.5× / 8.4×** |
-| `GET /hello/:name` | 2 060 rps, p95 6ms | 7 770 rps, p95 3ms | 16 500 rps, p95 1ms | **3.8× / 8×** |
-| `GET /json 3k` | 1 360 rps, p95 9ms | 6 600 rps, p95 3ms | 12 000 rps, p95 2ms | **4.9× / 8.8×** |
-| `POST /echo 3k` | 1 020 rps, p95 10ms | 5 500 rps, p95 4ms | 15 000 rps, p95 2ms | **5.4× / 15×** |
-| `GET /dummy_499` (500 routes) | 2 000 rps | 7 300 rps | 17 000 rps | **3.6× / 8.5×** |
-| Test client (no network) | 4 900 rps | 330 000 rps | 330 000 rps | **67×** |
+| `GET /` → `"hi"` (lightweight) | 2 207 rps, p95 5.5ms | 7 608 rps, p95 3ms | 18 000 rps, p95 1ms | **3.4× / 8.2×** |
+| `GET /hello/:name` | 2 217 rps, p95 6ms | 7 477 rps, p95 1.5ms | 16 500 rps, p95 1ms | **3.4× / 7.4×** |
+| `GET /json 3k` | 1 450 rps, p95 8.6ms | 5 848 rps, p95 2.4ms | 12 000 rps, p95 2ms | **4.0× / 8.3×** |
+| `POST /echo 3k` | 1 112 rps, p95 12ms | 8 955 rps, p95 4.3ms | 15 000 rps, p95 2ms | **8.1× / 13×** |
+| `GET /dummy_499` (500 routes) | 2 387 rps | 7 166 rps | 17 000 rps | **3.0× / 7.1×** |
+| Test client (no network) | 5.6k rps | 270k rps | 270k rps | **48×** |
 | CPU (per endpoint mean) | ~80% (1 core) | ~60% | ~120% (2 cores Tokio) | — |
 | MEM (RSS per worker) | ~45MB | ~55MB | ~35MB | — |
 

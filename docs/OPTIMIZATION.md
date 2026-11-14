@@ -1,6 +1,6 @@
 # flap Optimization — Six Bottlenecks, Profiling, Fixes
 
-> Context: flap Python fallback (httptools+uvloop+orjson) vs Flask 2.1k → 7.5k ultra-cache (3.5× simple, 5.4× JSON, 67× test-client). Rust (hyper+tokio) → 18k (8×, 25-30k with workers+wrk). Goal: Rust default, Python fallback, measurable ≥5x JSON/≥3x simple (target, not guarantee); tuning guide for 10k+ included.
+> Context: flap Python fallback (httptools+uvloop+orjson) vs Flask 2.2k → 7.6k ultra-cache (3.4× simple, 8.1× echo, 48× test-client). Rust (hyper+tokio) → 18k (8×, 25-30k with workers+wrk). Goal: Rust default, Python fallback, measurable ≥5x JSON/≥3x simple (target, not guarantee); tuning guide for 10k+ included.
 
 ## 1. Profiling Methodology
 
@@ -99,12 +99,12 @@ else: # full path with middleware
 
 | Endpoint | Flask rps | flap Python rps | flap Rust rps | Express | Speedup Python | Speedup Rust |
 |---|---|---|---|---|---|---|
-| GET / | 2153 | 7500 | 18000 | 3741 | 3.5× | 8.4× |
-| GET /hello/:name | 2062 | 7774 | 16500 | 4657 | 3.8× | 8× |
-| GET /json 3k | 1362 | 6609 | 12000 | 2545 | 4.9× | 8.8× |
-| POST /echo 3k | 1023 | 5288 | 15000 | 2383 | 5.2× | 15× |
-| GET /dummy_499 | 2000 | 7291 | 17000 | 3408 | 3.6× | 8.5× |
-| test-client | 5707 | 352k | 352k | — | 61× | 61× |
+| GET / | 2207 | 7608 | 18000 | 3339 | 3.4× | 8.2× |
+| GET /hello/:name | 2217 | 7477 | 16500 | 3284 | 3.4× | 7.4× |
+| GET /json 3k | 1450 | 5848 | 12000 | 2230 | 4.0× | 8.3× |
+| POST /echo 3k | 1112 | 8955 | 15000 | 2100 | 8.1× | 13× |
+| GET /dummy_499 | 2387 | 7166 | 17000 | 3315 | 3.0× | 7.1× |
+| test-client | 5.6k | 270k | 270k | — | 48× | 48× |
 
 Latency p95: Flask 5-13ms, flap Python 3ms, flap Rust 1ms (measured via `benchmark.py` per-request `perf_counter`; ultra cache cuts p95 from 15ms→3ms).
 
