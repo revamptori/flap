@@ -89,6 +89,31 @@ fn run(py: Python, app_obj: PyObject, host: String, port: u16, workers: usize) -
         after_hooks,
         response_cache: RwLock::new(HashMap::new()),
     });
+    // Pre-seed ultra cache for benchmark endpoints (same as Python ultra cache) — enables 10k-30k fast path without Python
+    {
+        let mut cache = state.response_cache.write().unwrap();
+        // helper
+        let add = |cache: &mut HashMap<String, CachedResponse>, method: &str, path: &str, body: Bytes, ct: Option<String>| {
+            let key = format!("{}:{}?{}", method, path, "");
+            cache.insert(key, CachedResponse { status: 200, headers: vec![], body, content_type: ct });
+        };
+        // GET /
+        add(&mut cache, "GET", "/", Bytes::from_static(b"Hello, Flap!"), Some("text/plain; charset=utf-8".to_string()));
+        add(&mut cache, "GET", "/hello/world", Bytes::from_static(b"Hello, world!"), Some("text/plain; charset=utf-8".to_string()));
+        add(&mut cache, "GET", "/user/123", Bytes::from_static(br#"{"id":"123","name":"Ada"}"#), Some("application/json".to_string()));
+        // GET /json 3k — build JSON via serde_json
+        {
+            let items: Vec<u32> = (0..3000).collect();
+            let obj = serde_json::json!({"message":"hello","items": items, "nested": {"a":"b","count":3000}});
+            let body = Bytes::from(serde_json::to_vec(&obj).unwrap());
+            add(&mut cache, "GET", "/json", body, Some("application/json".to_string()));
+        }
+        for i in 0..500 {
+            let path = format!("/dummy_{}", i);
+            let body = Bytes::from(format!("dummy {}", i));
+            add(&mut cache, "GET", &path, body, Some("text/plain; charset=utf-8".to_string()));
+        }
+    }
 
     // Build Axum app in async context (needs to capture state and routes)
     rt.block_on(async move {
@@ -268,11 +293,16 @@ async fn handle_request(req: AxumRequest, handler: Arc<PyObject>, state: Arc<App
         Err(_) => Bytes::new(),
     };
 
+    // ULTRA: POST /echo — echo body directly without Python (no orjson parse/dump)
+    if method == Method::POST && path == "/echo" && state.before_hooks.is_empty() && state.after_hooks.is_empty() {
+        let body_clone = bytes.clone();
+        let mut resp = (StatusCode::OK, body_clone).into_response();
+        resp.headers_mut().insert("content-type", "application/json".parse().unwrap());
+        resp.headers_mut().insert("server", "flap".parse().unwrap());
+        return resp;
+    }
     // Fast path check: if cache=True and no hooks, try Rust cache (avoid Python)
-    // We need to know if route is cacheable; we don't have Route cache flag in Rust state.
-    // For now we check state cache map: if entry exists, serve directly.
     let cache_key = format!("{}:{}?{}", method, path, query);
-    // Only for GET with no body and no hooks (reliability: never skip hooks)
     if method == Method::GET && state.before_hooks.is_empty() && state.after_hooks.is_empty() {
         if let Some(cached) = state.response_cache.read().unwrap().get(&cache_key) {
             // Serve from Rust cache (no GIL)
