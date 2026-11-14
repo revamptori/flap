@@ -101,9 +101,11 @@ def main():
     try:
         if not args.no_start:
             here = pathlib.Path(__file__).parent
-            procs["flask"] = start_server("flask", [sys.executable, str(here/"flask_app.py")], cwd=str(here.parent))
+            proj_root = str(here.parent)
+            env_with_root = {**os.environ, "PYTHONPATH": proj_root + (":" + os.environ.get("PYTHONPATH","") if os.environ.get("PYTHONPATH") else "")}
+            procs["flask"] = start_server("flask", [sys.executable, str(here/"flask_app.py")], cwd=str(here.parent), env=env_with_root)
             # flap Python fallback (default)
-            procs["flap"] = start_server("flap", [sys.executable, str(here/"flap_app.py")], cwd=str(here.parent))
+            procs["flap"] = start_server("flap", [sys.executable, str(here/"flap_app.py")], cwd=str(here.parent), env=env_with_root)
             # flap Rust if available: run on 8001 with FLAP_ENGINE=rust
             try:
                 import flap
@@ -112,6 +114,11 @@ def main():
                     # Need a flap_app variant that reads FLAP_PORT; for now start same but on 8001 via custom wrapper
                     # Create temp runner that sets port
                     wrapper = f"import os; from benchmarks.flap_app import app; app.run(host='127.0.0.1',port={PORTS['flap_rust']},workers=1)"
+                    env_rust["PYTHONPATH"] = os.environ.get("PYTHONPATH","")
+                    if env_rust["PYTHONPATH"]:
+                        env_rust["PYTHONPATH"] = str(here.parent) + ":" + env_rust["PYTHONPATH"]
+                    else:
+                        env_rust["PYTHONPATH"] = str(here.parent)
                     procs["flap_rust"] = start_server("flap_rust", [sys.executable,"-c",wrapper], cwd=str(here.parent), env=env_rust)
             except: pass
             if shutil.which("node") and (here/"express"/"app.js").exists():

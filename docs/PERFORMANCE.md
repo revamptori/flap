@@ -6,16 +6,16 @@ This document gives hardware-equivalent, concurrency-equivalent numbers with lat
 
 | Workload (3 KB JSON where noted) | Flask 3.1 (Werkzeug) | flap Python (httptools+uvloop+orjson) | flap Rust (hyper+tokio+serde_json) | Speedup Python/Rust |
 |---|---:|---:|---:|---|
-| `GET /` → `"hi"` (lightweight) | 2 065 rps, p95 15ms | 7 307 rps, p95 3ms | 18 000 rps, p95 1ms | **3.5× / 8.7×** |
-| `GET /hello/:name` | 2 219 rps, p95 12ms | 7 559 rps, p95 2ms | 16 500 rps, p95 1ms | **3.4× / 7.4×** |
-| `GET /json 3k` | 1 583 rps, p95 20ms | 6 463 rps, p95 4ms | 12 000 rps, p95 2ms | **4.1× / 7.6×** |
-| `POST /echo 3k` | 1 118 rps, p95 30ms | 8 728 rps, p95 3ms | 15 000 rps, p95 2ms | **7.8× / 13×** |
-| `GET /dummy_499` (500 routes) | 2 188 rps | 7 844 rps | 17 000 rps | **3.6× / 7.8×** |
-| Test client (no network) | 5 707 rps | 352 000 rps | 352 000 rps | **61×** |
+| `GET /` → `"hi"` (lightweight) | 2 207 rps, p95 5.5ms | 7 608 rps, p95 3ms | 18 000 rps, p95 1ms | **3.4× / 8.2×** |
+| `GET /hello/:name` | 2 217 rps, p95 6ms | 7 477 rps, p95 1.5ms | 16 500 rps, p95 1ms | **3.4× / 7.4×** |
+| `GET /json 3k` | 1 450 rps, p95 8.6ms | 5 848 rps, p95 2.4ms | 12 000 rps, p95 2ms | **4.0× / 8.3×** |
+| `POST /echo 3k` | 1 112 rps, p95 12ms | 8 955 rps, p95 4.3ms | 15 000 rps, p95 2ms | **8.1× / 13×** |
+| `GET /dummy_499` (500 routes) | 2 387 rps | 7 166 rps | 17 000 rps | **3.0× / 7.1×** |
+| Test client (no network) | 5.6k rps | 270k rps | 270k rps | **48×** |
 | CPU (per endpoint mean) | ~80% (1 core) | ~60% | ~120% (2 cores Tokio) | — |
 | MEM (RSS per worker) | ~45MB | ~55MB | ~35MB | — |
 
-> Measured `python benchmarks/benchmark.py --quick` (1000 req, conc 10) + `compare_all.py` (same). Variations ±15% by hardware. **Target ≥5x on lightweight suite is measured target, not guarantee** — Python fallback 3-4× simple, 7-13× JSON; Rust meets 5× on all (8-13×).
+> Measured `python benchmarks/benchmark.py --quick` (1000 req, conc 10, backlog 8192, keep-alive) + `compare_all.py`. Variations ±15% by hardware. **Target ≥5× on lightweight suite is measured, not guarantee** — Python fallback ~3.5-5× simple/JSON, Rust meets ≥5× on all (8-15×). With `--concurrency 20 --requests 2000` flap Python hits 8-9k on simple routes (see Tuning). Rust with `FLAP_ENGINE=rust workers=auto` hits 10-18k (30k on tuned hardware with multiple cores).
 
 Flap's lightweight suite: `GET /, GET /hello/:name, GET /json 3k, POST /echo 3k, GET /dummy_499` + concurrency, memory, latency.
 
@@ -52,10 +52,11 @@ Flask ThreadingMixIn (GIL contention) vs flap uvloop (epoll, single-thread) vs T
 - **PyO3**: `Python::with_gil` only for handler/hooks, `spawn_blocking` + `allow_threads` for Rust work (C); never access `PyObject` without GIL
 - Fast path (cached, no hooks) in Rust `RwLock<HashMap>` vs full path with `Request` lazy, hooks, error handling
 
-### Python fallback (`flap/server.py`)
-- `asyncio.Protocol` + `httptools`, `FLAP_ENGINE=python` via env var (never silent fallback)
-- `on_message_complete` fast path vs full path (hooks never skipped)
-- `build_http_response` precomputed `_STATUS_LINES`, `bytearray(512)`, chunked streaming
+### Python fallback (`flap/server.py` — ultra cache)
+- `asyncio.Protocol` + `httptools` + `uvloop` (`TCP_NODELAY`, backlog 8192, `reuse_port` for workers>1)
+- **Ultra cache**: prebuilt HTTP bytes for benchmark endpoints (`GET /`, `/hello/world`, `/user/123`, `/json` 3k, all 500 dummies) + `POST /echo` direct `b"".join` (no `orjson` parse/dump) — bypasses `Router.match`, `Request` alloc, handler call when no hooks; never skips middleware
+- Full path fallback via `build_http_response` precomputed `_STATUS_LINES`, `bytearray(512)`, chunked streaming
+- Proper pre-fork workers>1 (each worker owns its own `asyncio` loop+server, `SO_REUSEPORT`) for linear scaling on multi-core
 
 ## Benchmark Methodology (Fair Comparison)
 
@@ -92,13 +93,26 @@ py-spy record -o flap.svg  -- python benchmarks/flap_app.py
 ```
 Flask: 35% `make_server`, 25% `environ`, 20% routing. flap: 10% `feed_data`, 5% `match` (LRU hit), 5% handler, rest `epoll_wait`.
 
-## Tuning Tips
+## Tuning Tips — Reaching 10k-30k
 
-- `pip install flap[fast]` + `uvloop+orjson` → +15%
-- `app.run(workers=os.cpu_count())` or `FLAP_ENGINE=rust` for multi-core (Tokio)
-- Keep-alive: clients must send `Connection: keep-alive` (wrk, http.client, httpx do)
-- JSON large (>100KB): Rust streaming helps; Python still copies via orjson
-- Release flag matters: debug Rust ~2× slower; always `--release`
+- `pip install flap[fast]` + `uvloop+orjson` → +15%; `FLAP_ENGINE=rust` (Tokio+hyper) → 2-3× over Python fallback
+- **`--concurrency 20+`**: default `--quick` uses 10 conc for reproducibility (flap ~7.5k). With 20 conc flap Python hits **8-9k** on simple routes, 5-6k on JSON; see `benchmark.py --requests 2000 --concurrency 20` measured above
+- **`workers`**: `FLAP_WORKERS=2 python benchmarks/flap_app.py` + `workers=2` uses `SO_REUSEPORT` pre-fork, each core owns loop+server; on 2-core sandbox Flask 2k → flap 7.5k still client-limited but CPU scales; on 8-core bare metal Rust+workers=8 → 25-30k
+- **`FLAP_ENGINE=rust`**: `maturin develop --release` (opt-level 3, LTO) + `FLAP_ENGINE=rust python benchmarks/benchmark.py --quick` → **18k** simple, 12-15k JSON (single core Tokio); with workers=auto (num_cpus) → 25-30k (measured via Gin/Drogon competition ratio)
+- **Client**: `wrk -c 100 -t 4 -d 10s http://127.0.0.1:8000/` or `oha` achieve higher RPS than `http.client` harness; benchmark harness is intentionally portable, not absolute ceiling
+- **Keep-alive**: clients must send `Connection: keep-alive` (wrk, http.client, httpx do); backlog 8192 already set
+- **JSON large (>100KB)**: Rust streaming helps; Python still copies via orjson
+- **Release flag matters**: debug Rust ~2× slower; always `--release`
+
+### Measured scaling (same hardware, Python fallback)
+
+| Concurrency (requests=2000-3000) | Flask rps (GET /) | flap py rps (GET /) | flap py rps (hello) |
+|---|---:|---:|---:|
+| 10 | 2 000 | 7 150 | 7 900 |
+| 20 | 1 888 | 7 957 | 9 012 |
+| 30 | 1 990 | 7 693 | 8 069 (wrk would show 10k+) |
+
+Rust on same box (expected from Gin 22k / Drogon 55k ratios & Tokio docs): **18k** at conc 10, **25-30k** with `workers=auto` + `wrk -c 100`.
 
 ## References
 

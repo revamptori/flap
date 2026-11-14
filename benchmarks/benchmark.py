@@ -177,11 +177,17 @@ def main():
             here = os.path.dirname(__file__)
             flask_app = os.path.join(here, "flask_app.py")
             flap_app = os.path.join(here, "flap_app.py")
+            proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            def _env_with_root():
+                e = os.environ.copy()
+                pp = e.get("PYTHONPATH", "")
+                e["PYTHONPATH"] = proj_root + (":" + pp if pp else "")
+                return e
             print(f"Starting Flask on {args.flask_url}...")
-            p1 = subprocess.Popen([sys.executable, flask_app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p1 = subprocess.Popen([sys.executable, flask_app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_env_with_root())
             procs.append(p1); pids["flask"] = p1.pid
             print(f"Starting flap (Python/Rust auto) on {args.flap_url}...")
-            env = os.environ.copy()
+            env = _env_with_root()
             # Allow override via FLAP_ENGINE env var; default auto (Rust if available)
             # For benchmark we run Python fallback explicitly on 8000 to have comparable numbers
             # If user wants Rust, set FLAP_ENGINE=rust externally and it will run Rust on 8000

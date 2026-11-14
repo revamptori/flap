@@ -42,5 +42,6 @@ if __name__ == "__main__":
     # Support FLAP_PORT env var for competition harness (flap_rust on 8001)
     port = int(os.getenv("FLAP_PORT", os.getenv("PORT", "8000")))
     host = os.getenv("FLAP_HOST", "127.0.0.1")
+    workers = int(os.getenv("FLAP_WORKERS", "1"))
     # FLAP_ENGINE is handled inside app.run() (rust default, python fallback)
-    app.run(host=host, port=port, workers=1)
+    app.run(host=host, port=port, workers=workers)

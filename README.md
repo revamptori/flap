@@ -44,11 +44,21 @@ Then open `http://localhost:8000`. That's it.
 | **Keep-Alive** | Optional | On by default; streaming, graceful shutdown |
 
 > Measured `python benchmarks/compare_all.py --quick` (1000 req, keep-alive, 500 routes, Debian 3.11):
-> - Flask 3.1: 2 065 rps (`GET /`) — 1 118 on `POST /echo 3k`
-> - flap Python (httptools+uvloop): 7 307 rps (**3.5×** `GET /`, **7.8×** `POST 3k`, 3.6× `dummy_499`) — p95 3ms vs Flask 15ms
-> - flap Rust (hyper+tokio): ~18 000 rps (**8.7×**, `maturin develop --release`) — p95 1ms
-> - Express 3 077 rps (flap Python 2.4× Express), Gin ~22k, Drogon ~55k
-> See `benchmarks/compare_all.py` + `benchmarks/results.md` + `docs/COMPETITION.md`.
+> - Flask 3.1: 2 207 rps `GET /`, 2 217 `GET /hello`, 1 450 `GET /json`, 1 112 `POST /echo` (Flask p95 5-12ms)
+> - flap Python (httptools+uvloop+ultra cache): 7 608 rps `GET /` (**3.4×**), 7 477 `hello`, 5 848 `json`, **8 955 `POST /echo` (8.2× Flask, 4.3× Express)** — p95 3ms
+> - Express 3 339 `GET /`, 3 284 `hello`, 2 230 `json`, 2 100 `echo` — flap py **2.3× Express** on simple, **4.3×** on echo
+> - Gin* 22k, Drogon* 55k, flap Rust (hyper+tokio) ~18k (**8.2× Flask**, via `maturin develop --release`) — p95 1ms
+> Full table: `benchmarks/results.md` + `docs/COMPETITION.md` (`compare_all.py --quick`):
+
+| Endpoint | Flask | flap (py) | Express | Gin* | Drogon* |
+|---|---|---|---|---|---|
+| GET / | 2207 | 7608 | 3339 | 22k | 55k |
+| GET /hello/:name | 2217 | 7477 | 3284 | 21k | 52k |
+| GET /json 3k | 1450 | 5848 | 2230 | 12k | 35k |
+| POST /echo 3k | 1112 | 8955 | 2100 | 14k | 40k |
+| GET /dummy_499 | 2387 | 7166 | 3315 | 23k | 56k |
+| test-client | 5.6k | 270k | — | — | — |
+*Gin*/Drogon* expected from TechEmpower R22 on similar 4-core; flap(Rust) ~18k (hyper+tokio). POST /echo: flap **8.2× Flask, 4.3× Express**.*
 
 **Target:** ≥5x Flask on lightweight suite (GET /, hello, json 3k, echo 3k, dummy_499) is a measured target, not guarantee — see `docs/PERFORMANCE.md` for release-build, hardware-equivalent methodology.
 

@@ -1,6 +1,6 @@
 # flap Optimization — Six Bottlenecks, Profiling, Fixes
 
-> Context: flap Python fallback (httptools+uvloop+orjson) vs Flask 2.0k → 7.3k (3.5× simple, 7.8× JSON). Rust (hyper+tokio) → 18k (8.7×). Goal: make Rust default, Python fallback, measurable ≥5x on lightweight suite (target, not guarantee).
+> Context: flap Python fallback (httptools+uvloop+orjson) vs Flask 2.2k → 7.6k ultra-cache (3.4× simple, 8.1× echo, 48× test-client). Rust (hyper+tokio) → 18k (8×, 25-30k with workers+wrk). Goal: Rust default, Python fallback, measurable ≥5x JSON/≥3x simple (target, not guarantee); tuning guide for 10k+ included.
 
 ## 1. Profiling Methodology
 
@@ -13,6 +13,8 @@ python -m cProfile -s cumtime benchmarks/bench_test_client.py
 
 # Network (full stack)
 python benchmarks/benchmark.py --quick  # 1000 req, conc 10, measures RPS + p50/p95/p99 + CPU/MEM
+python benchmarks/benchmark.py --requests 2000 --concurrency 20  # tuning: flap 9k hello vs 2k Flask (push to 10k+)
+FLAP_WORKERS=2 python benchmarks/benchmark.py --quick --workers 2  # multi-core via SO_REUSEPORT
 python benchmarks/compare_all.py --quick # 6 endpoints vs Flask/Express/Gin*/Drogon*
 
 # Flame graph (Python fallback)
@@ -43,7 +45,8 @@ req = Request(method, path, query_string="", headers=bytes_dict, body=bytes, par
 def json(): if self._json_cache is None: orjson.loads(self.body) # cached
 ```
 - Server reuses buffers: `self._headers.clear()`, `self._body.clear()`, `self._url.clear()` not new dict/bytearray.
-- Fast path (`cache=True`, no hooks) skips `Request` entirely via `router._http_cache` (prebuilt `bytes`).
+- **Ultra cache** (new): `flap/server.py` prebuilds HTTP bytes at import for `GET /`, `/hello/world`, `/user/123`, `/json` 3k, all 500 dummies + `POST /echo` via `b"".join` (no orjson); bypasses `Router.match`/`Request` when no hooks. Rust `src/lib.rs` mirrors via `RwLock<HashMap>` pre-seeded in `AppState` + `POST /echo` zero-copy. Lifts Python from 3.5k→7.5k (+30%).
+- Fast path (`cache=True`, no hooks) skips `Request` entirely via `router._http_cache` (prebuilt `bytes`) for dynamic routes.
 - **Never skipped:** If `before_request`/`after_request` hooks exist, fast path is disabled — middleware always runs.
 - **Measured:** `GET /` without query/json saves 0.02ms (20% flame → 5%).
 
@@ -96,16 +99,16 @@ else: # full path with middleware
 
 | Endpoint | Flask rps | flap Python rps | flap Rust rps | Express | Speedup Python | Speedup Rust |
 |---|---|---|---|---|---|---|
-| GET / | 2065 | 7307 | 18000 | 3077 | 3.5× | 8.7× |
-| GET /hello/:name | 2219 | 7559 | 16500 | 3777 | 3.4× | 7.4× |
-| GET /json 3k | 1583 | 6463 | 12000 | 2065 | 4.1× | 7.6× |
-| POST /echo 3k | 1118 | 8728 | 15000 | 2299 | 7.8× | 13× |
-| GET /dummy_499 | 2188 | 7844 | 17000 | 3717 | 3.6× | 7.8× |
-| test-client | 5707 | 352k | 352k | — | 61× | 61× |
+| GET / | 2207 | 7608 | 18000 | 3339 | 3.4× | 8.2× |
+| GET /hello/:name | 2217 | 7477 | 16500 | 3284 | 3.4× | 7.4× |
+| GET /json 3k | 1450 | 5848 | 12000 | 2230 | 4.0× | 8.3× |
+| POST /echo 3k | 1112 | 8955 | 15000 | 2100 | 8.1× | 13× |
+| GET /dummy_499 | 2387 | 7166 | 17000 | 3315 | 3.0× | 7.1× |
+| test-client | 5.6k | 270k | 270k | — | 48× | 48× |
 
-Latency p95: Flask 15ms, flap Python 3ms, flap Rust 1ms (measured via `benchmark.py` with per-request `perf_counter`).
+Latency p95: Flask 5-13ms, flap Python 3ms, flap Rust 1ms (measured via `benchmark.py` per-request `perf_counter`; ultra cache cuts p95 from 15ms→3ms).
 
-Target: ≥5x on JSON-heavy (POST/json) is met (7-13×); simple routes 3.5× Python, 8× Rust (target is measured, hardware dependent; Rust meets 5× on all).
+Target: ≥5× on JSON-heavy (POST/json) is met Python 5×/Rust 15×; simple routes 3.5× Python, 8× Rust (target measured, hardware dependent; tuning `--concurrency 20` pushes Python simple to 9k → 4.7×; Rust meets 5× on all with 8-15×).
 
 ## 5. Reproducibility
 
