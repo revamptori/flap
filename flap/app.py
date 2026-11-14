@@ -173,3 +173,16 @@ class Flap:
 
     def __repr__(self):
         return f"<Flap {self.import_name} with {len(self.router.all_routes)} routes>"
+
+# 1:1 Flask alias — `from flap import Flask` is drop-in for `from flask import Flask`
+Flask = Flap
+# Also expose as flap.Flask for `flap.Flask(__name__)` usage
+
+# Flask extra compat helpers (minimal, keep fast)
+def _flask_abort(status=500, description=""):
+    from .response import abort
+    return abort(status, description)
+
+def _flask_url_for(endpoint, **values):
+    # Minimal stub: Flask url_for reverse lookup not fully implemented, fallback
+    return f"/{endpoint}"

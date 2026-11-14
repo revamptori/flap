@@ -60,16 +60,7 @@ class Route:
         self.handler = handler
         self.cache = cache
         self._prebuilt = None
-        # Inspect handler signature once at startup (Bottleneck E: avoid per-request introspection)
-        try:
-            import inspect
-            sig = inspect.signature(handler)
-            self.needs_request = len(sig.parameters) > 0
-            self.is_coroutine = inspect.iscoroutinefunction(handler)
-        except Exception:
-            self.needs_request = True
-            self.is_coroutine = False
-        # detect if dynamic or static
+        # First compute path type to inform needs_request detection (Flask 1:1)
         self.is_dynamic = "<" in path
         if self.is_dynamic:
             self.regex, self.param_names, self.param_types = compile_path(path)
@@ -77,6 +68,43 @@ class Route:
             self.regex = None
             self.param_names = []
             self.param_types: Dict[str, str] = {}
+        # Inspect handler signature once at startup (Bottleneck E: avoid per-request introspection)
+        # Flask 1:1: handler may be def view(): ... (no req) using global `request`, or def view(req, id): with req
+        try:
+            import inspect
+            sig = inspect.signature(handler)
+            params = list(sig.parameters.values())
+            if len(params) == 0:
+                self.needs_request = False
+            else:
+                first = params[0].name.lower()
+                if first in ("req", "request", "_req", "req_"):
+                    self.needs_request = True
+                else:
+                    # First param is not req — check if it matches a path param (Flask-style)
+                    if self.param_names and params[0].name in self.param_names:
+                        self.needs_request = False
+                    elif len(params) == len(self.param_names) and not self.is_dynamic:
+                        # Static route with no path params but handler has params? treat as Flask-style
+                        # Actually static + Flask-style def hello(): would be 0 params, already handled
+                        self.needs_request = False
+                    elif len(params) == len(self.param_names):
+                        self.needs_request = False
+                    elif len(params) == len(self.param_names) + 1:
+                        # Could be flap-style with req but first not named req? fallback to True
+                        self.needs_request = True
+                    else:
+                        # Default: if param count equals path params -> Flask-style, else flap-style
+                        self.needs_request = len(params) != len(self.param_names)
+            self.is_coroutine = inspect.iscoroutinefunction(handler)
+        except Exception:
+            self.needs_request = True
+            self.is_coroutine = False
+        # (is_dynamic already computed above)
+        if self.is_dynamic:
+            pass  # already compiled
+        else:
+            pass
 
     def matches(self, method: str, path: str) -> Optional[Dict[str, Any]]:
         if method not in self.methods:

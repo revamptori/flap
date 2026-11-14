@@ -7,23 +7,31 @@ pip install flap
 ```
 
 ```python
-from flap import Flap
+# Flask 1:1 — just swap `flask` for `flap`
+from flap import Flask, request, jsonify
 
-app = Flap()
+app = Flask(__name__)
 
-@app.get("/")
-def hello(req):
+@app.route("/")
+def hello():
     return "Hello, Flap!"
 
-@app.get("/user/<id>")
-def get_user(req, id):
-    return {"id": id, "name": "Ada"}
+@app.route("/user/<id>", methods=["GET"])
+def get_user(id):
+    return jsonify({"id": id, "q": request.args.get("q", "")})
 
 @app.post("/echo")
-def echo(req):
-    return req.json()   # auto-parsed, auto-JSON response
+def echo():
+    return request.get_json()
 
 app.run(port=8000)
+
+# Explicit req still works (flap original):
+# from flap import Flap
+# app = Flap(__name__)
+# @app.get("/user/<id>")
+# def get_user(req, id):
+#     return {"id": id}
 ```
 
 Then open `http://localhost:8000`. That's it.
@@ -34,8 +42,8 @@ Then open `http://localhost:8000`. That's it.
 
 | Feature | Flask | flap |
 |---|---|---|
-| **Syntax** | `app.route("/")` | `app.get("/")` (same idea, shorter helpers) |
-| **Handler** | `def view():` with `request` globals | `def view(req, param):` explicit, no magic import |
+| **Syntax** | `app.route("/")` | `app.route("/")` **1:1** — `from flap import Flask` drop-in |
+| **Handler** | `def view():` with `request` globals | `def view():` with `from flap import request` **or** `def view(req, id):` — both work |
 | **Server** | Werkzeug WSGI (Python) | **Rust by default: Tokio + Hyper + Axum** (Python `httptools+uvloop` fallback via `FLAP_ENGINE=python`) |
 | **Throughput** | ~1-2k req/s (simple route) | **~10-20k req/s Rust, ~7k Python** (≥3-8× Flask) |
 | **JSON** | `jsonify` (Python json) | `orjson` (Rust) (Python fallback) / `serde_json` (Rust engine) |

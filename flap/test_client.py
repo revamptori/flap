@@ -2,7 +2,12 @@ from typing import Dict, Optional, Any, List
 from urllib.parse import parse_qs
 from .router import Router
 from .request import Request
-from .response import normalize_response, _STATUS_TEXT
+from .response import normalize_response, _STATUS_TEXT, HTTPException
+try:
+    from .globals import set_request_ctx, reset_request_ctx
+except ImportError:
+    def set_request_ctx(req): return (None, None)
+    def reset_request_ctx(tok): pass
 
 class TestResponse:
     """In-process response for TestClient (mirrors Flask's test response but minimal)"""
@@ -106,8 +111,8 @@ class TestClient:
         # Normalize headers lowercasing is not needed for test client but keep for consistency
         headers_lc = {k.lower(): v for k, v in (headers or {}).items()}
 
-        # Router match
-        handler, params = self.router.match(method.upper(), raw_path)
+        # Router match with route to inspect needs_request
+        handler, params, route = self.router.match_with_route(method.upper(), raw_path)
         if handler is None:
             return TestResponse(404, {}, b'{"error":"Not Found"}', "application/json")
 
@@ -120,57 +125,103 @@ class TestClient:
             params=params or {},
             ip="127.0.0.1",
         )
-
-        # before hooks
-        intercepted = None
-        for hook in self.before_hooks:
-            try:
-                r = hook(req)
-                if r is not None:
-                    intercepted = r
-                    break
-            except Exception as e:
-                # return 500 for hook error
-                return TestResponse(500, {}, b'{"error":"Before hook failed"}', "application/json")
-
-        if intercepted is not None:
-            status, resp_headers, resp_body, resp_ct = normalize_response(intercepted)
-        else:
-            try:
-                # Handle both sync and async handlers (test client is sync, so we run async via loop if needed)
-                import asyncio
-                if asyncio.iscoroutinefunction(handler):
-                    # Run async handler in new loop
-                    loop = asyncio.new_event_loop()
-                    try:
-                        if params:
-                            result = loop.run_until_complete(handler(req, **params))
-                        else:
-                            result = loop.run_until_complete(handler(req))
-                    finally:
-                        loop.close()
-                    status, resp_headers, resp_body, resp_ct = normalize_response(result)
-                else:
-                    if params:
-                        result = handler(req, **params)
-                    else:
-                        result = handler(req)
-                    status, resp_headers, resp_body, resp_ct = normalize_response(result)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return TestResponse(500, {}, b'{"error":"Internal Server Error"}', "application/json")
-
-            # after hooks
-            for hook in self.after_hooks:
+        tok = set_request_ctx(req)
+        try:
+            # before hooks — support Flask def before(): and Flap def before(req):
+            intercepted = None
+            intercepted_status = None
+            for hook in self.before_hooks:
                 try:
-                    maybe = hook(req, status, resp_headers, resp_body)
-                    if maybe is not None and isinstance(maybe, tuple) and len(maybe) == 4:
-                        status, resp_headers, resp_body, resp_ct = maybe
-                except Exception:
-                    pass
+                    try:
+                        r = hook(req)
+                    except TypeError:
+                        r = hook()
+                    if r is not None:
+                        intercepted = r
+                        break
+                except HTTPException as e:
+                    intercepted = e.description.encode()
+                    intercepted_status = e.status
+                    break
+                except Exception as e:
+                    return TestResponse(500, {}, b'{"error":"Before hook failed"}', "application/json")
 
-        return TestResponse(status, resp_headers, resp_body, resp_ct)
+            if intercepted is not None:
+                if intercepted_status is not None:
+                    status, resp_headers, resp_body, resp_ct = intercepted_status, {}, intercepted if isinstance(intercepted, bytes) else str(intercepted).encode(), "text/plain"
+                else:
+                    status, resp_headers, resp_body, resp_ct = normalize_response(intercepted)
+            else:
+                try:
+                    needs_req = getattr(route, "needs_request", True)
+                    import asyncio
+                    if asyncio.iscoroutinefunction(handler):
+                        loop = asyncio.new_event_loop()
+                        try:
+                            if needs_req:
+                                if params:
+                                    result = loop.run_until_complete(handler(req, **params))
+                                else:
+                                    result = loop.run_until_complete(handler(req))
+                            else:
+                                if params:
+                                    result = loop.run_until_complete(handler(**params))
+                                else:
+                                    result = loop.run_until_complete(handler())
+                        finally:
+                            loop.close()
+                        status, resp_headers, resp_body, resp_ct = normalize_response(result)
+                    else:
+                        if needs_req:
+                            if params:
+                                result = handler(req, **params)
+                            else:
+                                result = handler(req)
+                        else:
+                            if params:
+                                result = handler(**params)
+                            else:
+                                result = handler()
+                        # streaming generator in test client: collect
+                        if hasattr(result, "__next__") or (hasattr(result, "__iter__") and not isinstance(result, (str, bytes, dict, list, tuple, TestResponse))):
+                            try:
+                                chunks = []
+                                for chunk in result:  # type: ignore
+                                    if isinstance(chunk, str):
+                                        chunks.append(chunk.encode())
+                                    elif isinstance(chunk, bytes):
+                                        chunks.append(chunk)
+                                    else:
+                                        chunks.append(str(chunk).encode())
+                                status, resp_headers, resp_body, resp_ct = 200, {}, b"".join(chunks), "text/plain; charset=utf-8"
+                            except TypeError:
+                                status, resp_headers, resp_body, resp_ct = normalize_response(result)
+                        else:
+                            status, resp_headers, resp_body, resp_ct = normalize_response(result)
+                except HTTPException as e:
+                    return TestResponse(e.status, {}, e.description.encode(), "text/plain")
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return TestResponse(500, {}, b'{"error":"Internal Server Error"}', "application/json")
+
+                # after hooks — both signatures
+                for hook in self.after_hooks:
+                    try:
+                        try:
+                            maybe = hook(req, status, resp_headers, resp_body)
+                        except TypeError:
+                            maybe = hook(status)
+                        if maybe is not None and isinstance(maybe, tuple) and len(maybe) == 4:
+                            status, resp_headers, resp_body, resp_ct = maybe
+                    except HTTPException as e:
+                        status, resp_headers, resp_body, resp_ct = e.status, {}, e.description.encode(), "text/plain"
+                        break
+                    except Exception:
+                        pass
+            return TestResponse(status, resp_headers, resp_body, resp_ct)
+        finally:
+            reset_request_ctx(tok)
 
     # Sugar methods
     def get(self, path: str, **kwargs):

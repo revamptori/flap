@@ -25,6 +25,17 @@ from .app import Flap
 from .request import Request
 from .response import Response, jsonify, redirect
 from .test_client import TestClient
+# 1:1 Flask compat: Flask alias and globals
+from .app import Flask  # alias, see app.py
+try:
+    from .globals import request, g, session, set_request_ctx, reset_request_ctx
+except ImportError:
+    request = None  # type: ignore
+    g = None  # type: ignore
+    session = {}  # type: ignore
+    set_request_ctx = lambda req: (None, None)  # type: ignore
+    reset_request_ctx = lambda tok: None  # type: ignore
+from .response import abort, make_response, url_for  # Flask compat
 
 try:
     # Attempt to load Rust core if compiled (maturin develop --release)
@@ -60,7 +71,7 @@ def get_engine(explicit: str | None = None) -> str:
 def is_rust_available() -> bool:
     return _RUST_AVAILABLE
 
-__all__ = ["Flap", "Request", "Response", "jsonify", "redirect", "TestClient", "_RUST_AVAILABLE", "get_engine", "is_rust_available"]
+__all__ = ["Flap", "Flask", "Request", "Response", "jsonify", "redirect", "abort", "make_response", "url_for", "request", "g", "session", "TestClient", "_RUST_AVAILABLE", "get_engine", "is_rust_available"]
 
 __version__ = "1.0.0"
 __author__ = "flap contributors"
